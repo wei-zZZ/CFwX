@@ -1,132 +1,182 @@
 #!/usr/bin/env bash
-set -e
+set -Eeuo pipefail
+export DEBIAN_FRONTEND=noninteractive
 
-WORKDIR="/opt/argo-xray"
-XRAY_PORT=10000
-REALITY_PORT=443
+### ========= 基础 =========
+WORKDIR="/opt/argoxw"
+XRAY_DIR="/usr/local/xray"
+CF_DIR="/etc/cloudflared"
+SUB_DIR="/opt/sub"
+IP=$(curl -s4 ip.sb || curl -s4 ifconfig.me)
 
-green(){ echo -e "\033[32m$1\033[0m"; }
-red(){ echo -e "\033[31m$1\033[0m"; }
+GREEN="\033[1;32m"
+RED="\033[1;31m"
+YELLOW="\033[1;33m"
+NC="\033[0m"
 
-check_root() {
-  [ "$(id -u)" != "0" ] && red "请使用 root 运行" && exit 1
+log(){ echo -e "${GREEN}[INFO]${NC} $*"; }
+warn(){ echo -e "${YELLOW}[WARN]${NC} $*"; }
+err(){ echo -e "${RED}[ERR ]${NC} $*" >&2; }
+
+is_tty(){ [[ -t 0 && -t 1 ]]; }
+
+mkdir -p $WORKDIR $SUB_DIR
+
+### ========= 系统识别 =========
+detect_region() {
+  if curl -s https://ipinfo.io/country | grep -qi "US"; then
+    REGION="LA"
+  else
+    REGION="HK"
+  fi
+  log "识别区域：$REGION"
 }
 
-menu() {
-  echo ""
-  echo "====== Argo + Xray + Reality + WARP ======"
-  echo "1) 安装（全部）"
-  echo "2) 生成订阅"
-  echo "3) 卸载 / 重置"
-  echo "0) 退出"
-  read -p "请选择: " num
-  case "$num" in
-    1) install_all ;;
-    2) gen_sub ;;
-    3) uninstall ;;
-    0) exit ;;
-    *) red "无效选择" ;;
-  esac
+### ========= 安装依赖 =========
+install_base() {
+  apt update -y
+  apt install -y curl wget unzip jq socat uuid-runtime iproute2
 }
 
-install_deps() {
-  apt update
-  apt install -y curl wget unzip jq iptables
-}
-
+### ========= Xray =========
 install_xray() {
-  green "安装 Xray-core..."
+  log "安装 Xray"
   bash <(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)
-}
 
-install_warp_xray_only() {
-  green "安装 WARP（仅 Xray）..."
-  apt install -y wireguard resolvconf
-  curl -fsSL https://pkg.cloudflareclient.com/install.sh | bash
-  apt install -y cloudflare-warp
-  warp-cli --accept-tos registration new
-}
+  UUID=$(uuidgen)
+  REALITY_KEY=$(xray x25519 | awk '/Private key/ {print $3}')
+  REALITY_PUB=$(xray x25519 | awk '/Public key/ {print $3}')
+  PORT=443
+  SNI="www.cloudflare.com"
 
-gen_xray_config() {
-  read -p "请输入 UUID: " UUID
-  read -p "请输入 REALITY 域名伪装（如 www.microsoft.com）: " DEST
-
-  mkdir -p $WORKDIR/xray
-
-cat > $WORKDIR/xray/config.json <<EOF
+  cat > /usr/local/etc/xray/config.json <<EOF
 {
-  "inbounds":[{
-    "port": $REALITY_PORT,
+  "inbounds": [{
+    "port": $PORT,
     "protocol": "vless",
-    "settings":{
-      "clients":[{"id":"$UUID","flow":"xtls-rprx-vision"}],
-      "decryption":"none"
+    "settings": {
+      "clients": [{
+        "id": "$UUID",
+        "flow": "xtls-rprx-vision"
+      }],
+      "decryption": "none"
     },
-    "streamSettings":{
-      "network":"tcp",
-      "security":"reality",
-      "realitySettings":{
-        "dest":"$DEST:443",
-        "xver":1,
-        "serverNames":["$DEST"],
-        "privateKey":"$(xray x25519 | awk '/Private/{print $3}')"
+    "streamSettings": {
+      "network": "tcp",
+      "security": "reality",
+      "realitySettings": {
+        "show": false,
+        "dest": "$SNI:443",
+        "xver": 0,
+        "serverNames": ["$SNI"],
+        "privateKey": "$REALITY_KEY",
+        "shortIds": [""]
       }
     }
   }],
-  "outbounds":[
-    {"protocol":"freedom","tag":"direct"},
-    {"protocol":"wireguard","tag":"warp","settings":{"secretKey":"$(wg genkey)","address":["172.16.0.2/32"]}}
-  ]
+  "outbounds": [
+    { "protocol": "socks", "settings": { "servers": [{ "address": "127.0.0.1", "port": 40000 }] }, "tag": "warp" },
+    { "protocol": "freedom", "tag": "direct" }
+  ],
+  "routing": {
+    "rules": [{
+      "type": "field",
+      "outboundTag": "warp",
+      "domain": ["openai.com","chatgpt.com","netflix.com","google.com","steamcommunity.com"]
+    }]
+  }
 }
 EOF
+
+  systemctl enable xray --now
 }
 
+### ========= WARP（仅 Xray） =========
+install_warp() {
+  log "安装 WARP"
+  curl -fsSL https://pkg.cloudflareclient.com/install.sh | bash
+  apt install -y cloudflare-warp
+
+  warp-cli registration new || true
+  warp-cli mode proxy
+  warp-cli connect
+}
+
+### ========= Cloudflare Tunnel =========
 install_cloudflared() {
-  green "安装 Cloudflared..."
-  wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-  dpkg -i cloudflared-linux-amd64.deb
-}
+  log "安装 Cloudflare Tunnel"
+  wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -O /usr/bin/cloudflared
+  chmod +x /usr/bin/cloudflared
 
-cf_auth() {
-  read -p "Cloudflare Account ID: " CF_ACCOUNT
-  read -p "Cloudflare Global API Key: " CF_KEY
-}
+  read -rp "请输入 Cloudflare Account ID: " CF_ACCOUNT
+  read -rp "请输入 Global API Key: " CF_APIKEY
+  read -rp "请输入 Cloudflare Email: " CF_EMAIL
 
-create_tunnel() {
-  cloudflared tunnel login
-  cloudflared tunnel create argo-xray
-}
+  if [[ "$REGION" == "HK" ]]; then
+    read -rp "请输入 Zone ID（HK 域名用）: " CF_ZONE
+    read -rp "请输入 HK 使用的域名: " CF_DOMAIN
+  fi
 
-gen_cf_config() {
-  mkdir -p $WORKDIR/cloudflared
-  TUNNEL_ID=$(cloudflared tunnel list | awk '/argo-xray/{print $1}')
+  TUNNEL_NAME="${REGION,,}-tunnel"
+  TUNNEL_ID=$(cloudflared tunnel create $TUNNEL_NAME | grep -oE '[0-9a-f-]{36}')
 
-cat > $WORKDIR/cloudflared/config.yml <<EOF
+  mkdir -p $CF_DIR
+  cat > $CF_DIR/config.yml <<EOF
 tunnel: $TUNNEL_ID
-credentials-file: /root/.cloudflared/$TUNNEL_ID.json
+credentials-file: $CF_DIR/$TUNNEL_ID.json
+
 ingress:
-  - service: http://127.0.0.1:$XRAY_PORT
-  - service: http_status:404
+  - service: http://127.0.0.1:10000
 EOF
 
   cloudflared service install
 }
 
+### ========= 订阅 =========
 gen_sub() {
-  mkdir -p $WORKDIR/subscribe
-  IP=$(curl -s https://api.ipify.org)
-cat > $WORKDIR/subscribe/vless.txt <<EOF
-vless://UUID@$IP:443?security=reality&type=tcp#ARGO-XRAY
-EOF
-  green "订阅生成完成：$WORKDIR/subscribe/vless.txt"
+  SUB_FILE="$SUB_DIR/vless.txt"
+  echo "vless://$UUID@$IP:443?encryption=none&security=reality&sni=www.cloudflare.com&fp=chrome&type=tcp&flow=xtls-rprx-vision&pbk=$REALITY_PUB#${REGION}-Reality" > $SUB_FILE
+  log "订阅生成完成：$SUB_FILE"
 }
 
-uninstall() {
+### ========= 卸载 =========
+uninstall_all() {
   systemctl stop xray cloudflared || true
-  apt remove -y xray cloudflared cloudflare-warp
-  rm -rf $WORKDIR
-  green "已完全卸载"
+  apt purge -y cloudflare-warp xray cloudflared || true
+  rm -rf /usr/local/etc/xray /etc/cloudflared $WORKDIR
+  log "已彻底卸载"
 }
 
-check_root
-menu
+### ========= 自动安装 =========
+auto_install() {
+  detect_region
+  install_base
+  install_xray
+  install_warp
+  install_cloudflared
+  gen_sub
+  log "🎉 安装完成"
+}
+
+### ========= 菜单 =========
+menu() {
+  echo
+  echo "1) 安装（全部）"
+  echo "2) 卸载 / 重置"
+  echo "3) 生成订阅"
+  echo "0) 退出"
+  read -rp "选择: " c
+  case $c in
+    1) auto_install ;;
+    2) uninstall_all ;;
+    3) gen_sub ;;
+    0) exit 0 ;;
+  esac
+}
+
+### ========= 入口 =========
+if is_tty; then
+  menu
+else
+  auto_install
+fi
