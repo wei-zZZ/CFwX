@@ -93,6 +93,29 @@ EOF
 
 ### ========= WARP（仅 Xray） =========
 install_warp() {
+  log "安装 WARP（仅 Xray 使用）"
+
+  apt install -y lsb-release gnupg
+
+  curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+  | gpg --dearmor \
+  | tee /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg >/dev/null
+
+  echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] \
+https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
+  | tee /etc/apt/sources.list.d/cloudflare-client.list
+
+  apt update
+  apt install -y cloudflare-warp
+
+  # 初始化 WARP（不接管系统流量）
+  warp-cli registration new || true
+  warp-cli mode proxy
+  warp-cli connect
+
+  log "WARP 已启用（代理模式，仅供 Xray 使用）"
+}
+ {
   log "安装 WARP"
   curl -fsSL https://pkg.cloudflareclient.com/install.sh | bash
   apt install -y cloudflare-warp
