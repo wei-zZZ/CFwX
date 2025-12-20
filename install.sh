@@ -1,219 +1,239 @@
-#!/usr/bin/env bash
+#!/bin/bash
 set -e
 
-### ===== 用户配置 =====
-DOMAIN_HK="hkin.9420ce.top"
-UUID_HK="2828f347-d9f8-4342-85af-3ef06270793a"
-UUID_LA="c9360249-7aa9-4cf0-8edc-4c0362e84b0f"
-LA_INTERNAL="la.internal"
-### ====================
+BASE_DIR="/opt/xray-stack"
+SUB_DIR="/var/www/sub"
 
-ROLE=""
-OS_CODENAME=""
+mkdir -p $BASE_DIR $SUB_DIR
 
-msg() { echo -e "\033[1;32m[+] $1\033[0m"; }
-err() { echo -e "\033[1;31m[!] $1\033[0m"; }
-
-detect_role() {
-  local c
-  c=$(curl -fsSL https://ipinfo.io/country || true)
-  [[ "$c" == "US" ]] && ROLE="LA" || ROLE="HK"
-  msg "Detected role: $ROLE"
+################################
+# 工具函数
+################################
+pause() {
+  read -rp "按 Enter 继续..."
 }
 
-detect_os() {
-  . /etc/os-release
-  OS_CODENAME=$VERSION_CODENAME
-  msg "OS: $PRETTY_NAME ($OS_CODENAME)"
+is_root() {
+  if [ "$EUID" -ne 0 ]; then
+    echo "❌ 请使用 root 运行"
+    exit 1
+  fi
 }
 
-install_base() {
-  apt update
-  apt install -y curl wget jq unzip socat ca-certificates gnupg lsb-release
+detect_region() {
+  if curl -s ipinfo.io | grep -qi "Hong Kong"; then
+    REGION="HK"
+  else
+    REGION="LA"
+  fi
 }
 
+################################
+# 安装 xray + Reality
+################################
 install_xray() {
-  msg "Installing Xray"
-  bash <(curl -fsSL https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh)
+  echo "▶ 安装 xray + Reality"
+
+  bash <(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)
+
+  read -rp "请输入监听端口（默认 443）: " PORT
+  PORT=${PORT:-443}
+
+  read -rp "请输入 UUID: " UUID
+
+  KEY=$(xray x25519)
+  PRIVATE_KEY=$(echo "$KEY" | awk '/PrivateKey/ {print $2}')
+  PUBLIC_KEY=$(echo "$KEY" | awk '/PublicKey/ {print $2}')
+
+  read -rp "请输入 Reality SNI（如 www.cloudflare.com）: " SNI
+  read -rp "请输入 shortId（默认 abcd）: " SID
+  SID=${SID:-abcd}
+
+  cat > /usr/local/etc/xray/config.json <<EOF
+{
+  "inbounds": [
+    {
+      "port": ${PORT},
+      "protocol": "vless",
+      "settings": {
+        "clients": [{ "id": "${UUID}", "flow": "xtls-rprx-vision" }],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "tcp",
+        "security": "reality",
+        "realitySettings": {
+          "show": false,
+          "dest": "${SNI}:443",
+          "xver": 0,
+          "serverNames": ["${SNI}"],
+          "privateKey": "${PRIVATE_KEY}",
+          "shortIds": ["${SID}"]
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    { "protocol": "freedom", "tag": "direct" }
+  ]
+}
+EOF
+
+  systemctl restart xray
+
+  echo
+  echo "✅ xray 安装完成"
+  echo "PublicKey: ${PUBLIC_KEY}"
+  echo "UUID:      ${UUID}"
+
+  echo "${PORT}|${UUID}|${PUBLIC_KEY}|${SNI}|${SID}" > $BASE_DIR/xray.info
+  pause
 }
 
-install_cloudflared() {
-  msg "Installing cloudflared"
-  wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
-  dpkg -i cloudflared-linux-amd64.deb
-}
-
+################################
+# 安装 WARP（仅 xray 使用）
+################################
 install_warp() {
-  msg "Installing Cloudflare WARP (stable method)"
+  echo "▶ 安装 Cloudflare WARP"
 
-  curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
-    | gpg --dearmor \
-    | tee /usr/share/keyrings/cloudflare-warp.gpg >/dev/null
+  apt update
+  apt install -y curl gnupg lsb-release
 
-  echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp.gpg] \
-https://pkg.cloudflareclient.com/ ${OS_CODENAME} main" \
+  curl https://pkg.cloudflareclient.com/pubkey.gpg | gpg --dearmor > /usr/share/keyrings/cloudflare-warp.gpg
+  echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" \
     > /etc/apt/sources.list.d/cloudflare-client.list
 
   apt update
   apt install -y cloudflare-warp
 
-setup_warp() {
-  echo "[*] Configuring WARP"
+  warp-cli register
+  warp-cli connect
 
-  # 判断 warp-cli 是新版本还是旧版本
-  if warp-cli --help 2>&1 | grep -q "registration"; then
-    # 新版 warp-cli
-    warp-cli registration new || true
-    warp-cli mode proxy || true
-  else
-    # 旧版 warp-cli
-    warp-cli register || true
-    warp-cli set-mode proxy || true
-  fi
-
-  warp-cli connect || true
+  echo "✅ WARP 已连接（仅用于 xray）"
+  pause
 }
 
+################################
+# 安装 Cloudflare Tunnel
+################################
+install_tunnel() {
+  echo "▶ 安装 Cloudflare Tunnel"
 
-}
+  curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+    -o /usr/bin/cloudflared
+  chmod +x /usr/bin/cloudflared
 
-setup_tunnel() {
-  msg "Cloudflare Tunnel login required"
-  cloudflared tunnel login
+  read -rp "请输入 Cloudflare Account ID: " CF_ACCOUNT
+  read -rp "请输入 Global API Key: " CF_API
+  read -rp "请输入 Tunnel 名称: " TUNNEL_NAME
+
+  export CF_API_KEY="$CF_API"
+  export CF_ACCOUNT_ID="$CF_ACCOUNT"
+
+  cloudflared tunnel create "$TUNNEL_NAME"
+
+  TUNNEL_ID=$(cloudflared tunnel list | grep "$TUNNEL_NAME" | awk '{print $1}')
 
   mkdir -p /etc/cloudflared
 
-  if [[ "$ROLE" == "HK" ]]; then
-    cloudflared tunnel create hk-tunnel
-    cat > /etc/cloudflared/config.yml <<EOF
-tunnel: hk-tunnel
-credentials-file: /etc/cloudflared/hk-tunnel.json
+  cat > /etc/cloudflared/config.yml <<EOF
+tunnel: ${TUNNEL_ID}
+credentials-file: /etc/cloudflared/${TUNNEL_ID}.json
+
 ingress:
-  - hostname: ${DOMAIN_HK}
-    service: http://127.0.0.1:10000
-  - service: http_status:404
+  - service: http://127.0.0.1:10000
 EOF
-    cloudflared tunnel route dns hk-tunnel ${DOMAIN_HK}
-  else
-    cloudflared tunnel create la-tunnel
-    cat > /etc/cloudflared/config.yml <<EOF
-tunnel: la-tunnel
-credentials-file: /etc/cloudflared/la-tunnel.json
-ingress:
-  - hostname: ${LA_INTERNAL}
-    service: http://127.0.0.1:20000
-  - service: http_status:404
-EOF
-    cloudflared tunnel route dns la-tunnel ${LA_INTERNAL}
-  fi
 
-  systemctl enable cloudflared --now
+  cloudflared service install
+  systemctl enable cloudflared
+  systemctl restart cloudflared
 
-  systemctl edit cloudflared <<EOF
-[Service]
-Environment=NO_PROXY=127.0.0.1,localhost
-EOF
+  echo "✅ Tunnel 已启动"
+  pause
 }
 
-setup_xray() {
-  msg "Configuring Xray"
-  mkdir -p /usr/local/etc/xray
+################################
+# 生成订阅
+################################
+gen_sub() {
+  echo "▶ 生成客户端订阅"
 
-  if [[ "$ROLE" == "LA" ]]; then
-cat > /usr/local/etc/xray/config.json <<EOF
-{
-  "inbounds": [{
-    "listen": "127.0.0.1",
-    "port": 20000,
-    "protocol": "vless",
-    "settings": {
-      "clients": [{ "id": "${UUID_LA}" }],
-      "decryption": "none"
-    }
-  }],
-  "outbounds": [{
-    "protocol": "socks",
-    "settings": {
-      "servers": [{
-        "address": "127.0.0.1",
-        "port": 40000
-      }]
-    }
-  }]
-}
-EOF
-  else
-cat > /usr/local/etc/xray/config.json <<EOF
-{
-  "inbounds": [{
-    "listen": "127.0.0.1",
-    "port": 10000,
-    "protocol": "vless",
-    "settings": {
-      "clients": [{ "id": "${UUID_HK}" }],
-      "decryption": "none"
-    }
-  }],
-  "routing": {
-    "rules": [{
-      "type": "field",
-      "geoip": ["us"],
-      "outboundTag": "to-la"
-    }]
-  },
-  "outbounds": [
-    {
-      "tag": "direct",
-      "protocol": "socks",
-      "settings": {
-        "servers": [{
-          "address": "127.0.0.1",
-          "port": 40000
-        }]
-      }
-    },
-    {
-      "tag": "to-la",
-      "protocol": "vless",
-      "settings": {
-        "vnext": [{
-          "address": "${LA_INTERNAL}",
-          "port": 443,
-          "users": [{ "id": "${UUID_LA}" }]
-        }]
-      }
-    }
-  ]
-}
-EOF
-  fi
+  detect_region
 
-  systemctl restart xray
+  IFS="|" read PORT UUID PUBKEY SNI SID < $BASE_DIR/xray.info
+
+  read -rp "请输入服务器地址（域名或 IP）: " SERVER
+
+  VLESS="vless://${UUID}@${SERVER}:${PORT}?encryption=none&flow=xtls-rprx-vision&security=reality&sni=${SNI}&fp=chrome&pbk=${PUBKEY}&sid=${SID}#${REGION}"
+
+  echo "$VLESS" | base64 -w0 > $SUB_DIR/vless.txt
+  echo "$VLESS" > $SUB_DIR/info.txt
+
+  python3 -m http.server 8080 --directory $SUB_DIR >/dev/null 2>&1 &
+
+  echo
+  echo "✅ 订阅生成完成"
+  echo "订阅地址: http://${SERVER}:8080/vless.txt"
+  pause
 }
 
+################################
+# 卸载 / 重置
+################################
 uninstall_all() {
-  err "Uninstalling everything"
+  echo "⚠️ 即将完全卸载"
+  read -rp "确认继续？[y/N]: " OK
+  [ "$OK" != "y" ] && return
+
   systemctl stop xray cloudflared || true
-  apt purge -y cloudflare-warp cloudflared || true
-  rm -rf /etc/cloudflared /usr/local/etc/xray
-  err "Done"
+  systemctl disable xray cloudflared || true
+
+  rm -rf /usr/local/etc/xray
+  rm -f /usr/local/bin/xray
+  rm -f /etc/systemd/system/xray.service
+
+  rm -rf /etc/cloudflared /root/.cloudflared
+  rm -f /usr/bin/cloudflared
+  rm -f /etc/systemd/system/cloudflared.service
+
+  warp-cli disconnect || true
+  warp-cli deregister || true
+  apt purge -y cloudflare-warp || true
+
+  rm -rf $BASE_DIR $SUB_DIR
+
+  systemctl daemon-reload
+
+  echo "✅ 已完全卸载，建议 reboot"
+  pause
 }
 
-### ===== main =====
-case "$1" in
-  uninstall)
-    uninstall_all
-    ;;
-  *)
-    detect_role
-    detect_os
-    install_base
-    install_xray
-    install_cloudflared
-    install_warp
-    setup_warp
-    setup_tunnel
-    setup_xray
-    msg "$ROLE node deployment finished"
-    ;;
-esac
+################################
+# 菜单
+################################
+is_root
+
+while true; do
+  clear
+  echo "=============================="
+  echo " HK / LA + Tunnel + WARP + Xray"
+  echo "=============================="
+  echo "1) 安装 Xray + Reality"
+  echo "2) 安装 WARP（仅 xray）"
+  echo "3) 安装 Cloudflare Tunnel"
+  echo "4) 生成客户端订阅"
+  echo "5) 卸载 / 重置"
+  echo "0) 退出"
+  echo
+  read -rp "请选择: " CHOICE
+
+  case $CHOICE in
+    1) install_xray ;;
+    2) install_warp ;;
+    3) install_tunnel ;;
+    4) gen_sub ;;
+    5) uninstall_all ;;
+    0) exit 0 ;;
+    *) echo "无效选择"; pause ;;
+  esac
+done
