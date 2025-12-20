@@ -12,7 +12,7 @@ Cloudflare Tunnel 的 login 授权步骤必须人工完成一次（CF 官方限�
 1️⃣ 在 HK / LA 两台服务器都执行
 
 
-bash <(curl -fsSL https://raw.github.com/wei-zZZ/CFwX/main/install.sh)
+bash <(curl -fsSL https://raw.githubusercontent.com/wei-zZZ/CFwX/main/install.sh)
 
 
 脚本会自动：
