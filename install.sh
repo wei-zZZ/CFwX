@@ -106,8 +106,15 @@ install_warp() {
   apt update
   apt install -y cloudflare-warp
 
+if warp-cli --help | grep -q "registration"; then
+  warp-cli registration new
+else
   warp-cli register
-  warp-cli connect
+fi
+
+warp-cli connect
+
+
 
   echo "✅ WARP 已连接（仅用于 xray）"
   pause
@@ -196,8 +203,13 @@ uninstall_all() {
   rm -f /usr/bin/cloudflared
   rm -f /etc/systemd/system/cloudflared.service
 
-  warp-cli disconnect || true
+warp-cli disconnect || true
+
+if warp-cli --help | grep -q "registration"; then
+  warp-cli registration delete || true
+else
   warp-cli deregister || true
+fi
   apt purge -y cloudflare-warp || true
 
   rm -rf $BASE_DIR $SUB_DIR
