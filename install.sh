@@ -57,9 +57,24 @@ https://pkg.cloudflareclient.com/ ${OS_CODENAME} main" \
   apt update
   apt install -y cloudflare-warp
 
-  warp-cli register || true
-  warp-cli set-mode proxy
+setup_warp() {
+  echo "[*] Configuring WARP"
+
+  # 判断 warp-cli 是新版本还是旧版本
+  if warp-cli --help 2>&1 | grep -q "registration"; then
+    # 新版 warp-cli
+    warp-cli registration new || true
+    warp-cli mode proxy || true
+  else
+    # 旧版 warp-cli
+    warp-cli register || true
+    warp-cli set-mode proxy || true
+  fi
+
   warp-cli connect || true
+}
+
+
 }
 
 setup_tunnel() {
@@ -196,6 +211,7 @@ case "$1" in
     install_xray
     install_cloudflared
     install_warp
+    setup_warp
     setup_tunnel
     setup_xray
     msg "$ROLE node deployment finished"
