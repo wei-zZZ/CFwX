@@ -1,236 +1,132 @@
 #!/usr/bin/env bash
 set -e
 
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-RESET="\033[0m"
+WORKDIR="/opt/argo-xray"
+XRAY_PORT=10000
+REALITY_PORT=443
 
-XRAY_DIR="/usr/local/etc/xray"
-CF_DIR="/etc/cloudflared"
-SUB_DIR="/root/subscription"
+green(){ echo -e "\033[32m$1\033[0m"; }
+red(){ echo -e "\033[31m$1\033[0m"; }
 
-########################################
-# 基础函数
-########################################
-msg() { echo -e "${GREEN}$1${RESET}"; }
-warn() { echo -e "${YELLOW}$1${RESET}"; }
-err() { echo -e "${RED}$1${RESET}"; }
-
-need_root() {
-  [[ $EUID -ne 0 ]] && err "请使用 root 运行" && exit 1
+check_root() {
+  [ "$(id -u)" != "0" ] && red "请使用 root 运行" && exit 1
 }
 
-########################################
-# 防 SSH：禁用 IPv6
-########################################
-disable_ipv6() {
-  msg "禁用 IPv6（防 SSH 断连）"
-  cat >/etc/sysctl.d/99-disable-ipv6.conf <<EOF
-net.ipv6.conf.all.disable_ipv6=1
-net.ipv6.conf.default.disable_ipv6=1
-EOF
-  sysctl --system >/dev/null
-}
-
-########################################
-# 安装依赖
-########################################
-install_base() {
-  apt update
-  apt install -y curl wget unzip jq socat iproute2 ca-certificates
-}
-
-########################################
-# 安装 Xray + Reality
-########################################
-install_xray() {
-  msg "安装 Xray"
-  bash <(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)
-
-  mkdir -p $XRAY_DIR
-
-  read -rp "请输入 Reality 域名（如 www.microsoft.com）: " REALITY_DOMAIN
-  read -rp "请输入 VLESS UUID（回车自动生成）: " UUID
-  UUID=${UUID:-$(cat /proc/sys/kernel/random/uuid)}
-
-  read -rp "请输入监听端口（默认 10000）: " XRAY_PORT
-  XRAY_PORT=${XRAY_PORT:-10000}
-
-  read -rp "请输入 Reality 公钥（回车自动生成）: " PUBKEY
-  read -rp "请输入 Reality 私钥（回车自动生成）: " PRIVKEY
-
-  if [[ -z "$PUBKEY" || -z "$PRIVKEY" ]]; then
-    KEYS=$(xray x25519)
-    PRIVKEY=$(echo "$KEYS" | grep Private | awk '{print $3}')
-    PUBKEY=$(echo "$KEYS" | grep Public | awk '{print $3}')
-  fi
-
-  cat >$XRAY_DIR/config.json <<EOF
-{
-  "inbounds": [{
-    "port": $XRAY_PORT,
-    "protocol": "vless",
-    "settings": {
-      "clients": [{
-        "id": "$UUID",
-        "flow": "xtls-rprx-vision"
-      }],
-      "decryption": "none"
-    },
-    "streamSettings": {
-      "network": "tcp",
-      "security": "reality",
-      "realitySettings": {
-        "dest": "$REALITY_DOMAIN:443",
-        "serverNames": ["$REALITY_DOMAIN"],
-        "privateKey": "$PRIVKEY",
-        "shortIds": [""]
-      }
-    }
-  }],
-  "outbounds": [{
-    "tag": "warp",
-    "protocol": "socks",
-    "settings": {
-      "servers": [{
-        "address": "127.0.0.1",
-        "port": 40000
-      }]
-    }
-  },{
-    "protocol": "freedom",
-    "tag": "direct"
-  }],
-  "routing": {
-    "rules": [{
-      "type": "field",
-      "outboundTag": "warp",
-      "domain": ["geosite:openai","geosite:netflix","geosite:google"]
-    }]
-  }
-}
-EOF
-
-  systemctl restart xray
-  msg "Xray 安装完成"
-}
-
-########################################
-# 安装 WARP（仅 Proxy）
-########################################
-install_warp() {
-  msg "安装 Cloudflare WARP（仅供 xray 使用）"
-
-  curl -fsSL https://pkg.cloudflareclient.com/install.sh | bash
-  apt install -y cloudflare-warp
-
-  warp-cli disconnect || true
-
-  if warp-cli --help | grep -q registration; then
-    warp-cli registration new || true
-  else
-    warp-cli register || true
-  fi
-
-  warp-cli mode proxy
-  warp-cli proxy port 40000
-  warp-cli connect
-
-  msg "WARP Proxy 启动成功（127.0.0.1:40000）"
-}
-
-########################################
-# 安装 Cloudflare Tunnel
-########################################
-install_tunnel() {
-  msg "安装 Cloudflare Tunnel"
-
-  apt install -y cloudflared
-  mkdir -p $CF_DIR
-
-  read -rp "是否需要 Tunnel？(y/n): " NEED_CF
-  [[ "$NEED_CF" != "y" ]] && return
-
-  read -rp "请输入 Tunnel Token: " CF_TOKEN
-
-  cat >/etc/systemd/system/cloudflared.service <<EOF
-[Unit]
-Description=cloudflared
-After=network.target
-
-[Service]
-ExecStart=/usr/bin/cloudflared tunnel run --token $CF_TOKEN
-Restart=always
-User=root
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-  systemctl daemon-reload
-  systemctl enable cloudflared
-  systemctl restart cloudflared
-
-  msg "Cloudflare Tunnel 启动完成"
-}
-
-########################################
-# 生成订阅
-########################################
-gen_sub() {
-  mkdir -p $SUB_DIR
-  IP=$(curl -s ipv4.ip.sb)
-
-  CONF=$(jq -r '.inbounds[0]' $XRAY_DIR/config.json)
-
-  UUID=$(echo "$CONF" | jq -r '.settings.clients[0].id')
-  PORT=$(echo "$CONF" | jq -r '.port')
-  SNI=$(echo "$CONF" | jq -r '.streamSettings.realitySettings.serverNames[0]')
-  PUBKEY=$(jq -r '.inbounds[0].streamSettings.realitySettings.privateKey' $XRAY_DIR/config.json)
-
-  cat >$SUB_DIR/vless.txt <<EOF
-vless://$UUID@$IP:$PORT?encryption=none&flow=xtls-rprx-vision&security=reality&sni=$SNI&fp=chrome&pbk=$PUBKEY&type=tcp#Reality-WARP
-EOF
-
-  msg "订阅生成完成：$SUB_DIR/vless.txt"
-}
-
-########################################
-# 卸载
-########################################
-uninstall_all() {
-  systemctl stop xray cloudflared warp-svc || true
-  apt purge -y cloudflare-warp cloudflared xray || true
-  rm -rf $XRAY_DIR $CF_DIR
-  msg "卸载完成"
-}
-
-########################################
-# 菜单
-########################################
 menu() {
-  echo
-  echo "1) 安装（Xray + Reality + WARP + Tunnel）"
+  echo ""
+  echo "====== Argo + Xray + Reality + WARP ======"
+  echo "1) 安装（全部）"
   echo "2) 生成订阅"
   echo "3) 卸载 / 重置"
   echo "0) 退出"
-  read -rp "请选择: " CHOICE
-
-  case $CHOICE in
-    1)
-      disable_ipv6
-      install_base
-      install_warp
-      install_xray
-      install_tunnel
-      ;;
+  read -p "请选择: " num
+  case "$num" in
+    1) install_all ;;
     2) gen_sub ;;
-    3) uninstall_all ;;
+    3) uninstall ;;
     0) exit ;;
-    *) warn "无效选项" ;;
+    *) red "无效选择" ;;
   esac
 }
 
-need_root
+install_deps() {
+  apt update
+  apt install -y curl wget unzip jq iptables
+}
+
+install_xray() {
+  green "安装 Xray-core..."
+  bash <(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)
+}
+
+install_warp_xray_only() {
+  green "安装 WARP（仅 Xray）..."
+  apt install -y wireguard resolvconf
+  curl -fsSL https://pkg.cloudflareclient.com/install.sh | bash
+  apt install -y cloudflare-warp
+  warp-cli --accept-tos registration new
+}
+
+gen_xray_config() {
+  read -p "请输入 UUID: " UUID
+  read -p "请输入 REALITY 域名伪装（如 www.microsoft.com）: " DEST
+
+  mkdir -p $WORKDIR/xray
+
+cat > $WORKDIR/xray/config.json <<EOF
+{
+  "inbounds":[{
+    "port": $REALITY_PORT,
+    "protocol": "vless",
+    "settings":{
+      "clients":[{"id":"$UUID","flow":"xtls-rprx-vision"}],
+      "decryption":"none"
+    },
+    "streamSettings":{
+      "network":"tcp",
+      "security":"reality",
+      "realitySettings":{
+        "dest":"$DEST:443",
+        "xver":1,
+        "serverNames":["$DEST"],
+        "privateKey":"$(xray x25519 | awk '/Private/{print $3}')"
+      }
+    }
+  }],
+  "outbounds":[
+    {"protocol":"freedom","tag":"direct"},
+    {"protocol":"wireguard","tag":"warp","settings":{"secretKey":"$(wg genkey)","address":["172.16.0.2/32"]}}
+  ]
+}
+EOF
+}
+
+install_cloudflared() {
+  green "安装 Cloudflared..."
+  wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+  dpkg -i cloudflared-linux-amd64.deb
+}
+
+cf_auth() {
+  read -p "Cloudflare Account ID: " CF_ACCOUNT
+  read -p "Cloudflare Global API Key: " CF_KEY
+}
+
+create_tunnel() {
+  cloudflared tunnel login
+  cloudflared tunnel create argo-xray
+}
+
+gen_cf_config() {
+  mkdir -p $WORKDIR/cloudflared
+  TUNNEL_ID=$(cloudflared tunnel list | awk '/argo-xray/{print $1}')
+
+cat > $WORKDIR/cloudflared/config.yml <<EOF
+tunnel: $TUNNEL_ID
+credentials-file: /root/.cloudflared/$TUNNEL_ID.json
+ingress:
+  - service: http://127.0.0.1:$XRAY_PORT
+  - service: http_status:404
+EOF
+
+  cloudflared service install
+}
+
+gen_sub() {
+  mkdir -p $WORKDIR/subscribe
+  IP=$(curl -s https://api.ipify.org)
+cat > $WORKDIR/subscribe/vless.txt <<EOF
+vless://UUID@$IP:443?security=reality&type=tcp#ARGO-XRAY
+EOF
+  green "订阅生成完成：$WORKDIR/subscribe/vless.txt"
+}
+
+uninstall() {
+  systemctl stop xray cloudflared || true
+  apt remove -y xray cloudflared cloudflare-warp
+  rm -rf $WORKDIR
+  green "已完全卸载"
+}
+
+check_root
 menu
