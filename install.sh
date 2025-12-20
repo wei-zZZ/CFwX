@@ -1,49 +1,72 @@
 #!/usr/bin/env bash
 set -e
 
-ROLE=""
-UUID_HK="11111111-1111-1111-1111-111111111111"
-UUID_LA="22222222-2222-2222-2222-222222222222"
-DOMAIN_HK="hk.your-domain.com"
+### ===== 用户配置 =====
+DOMAIN_HK="hkin.9420ce.top"
+UUID_HK="2828f347-d9f8-4342-85af-3ef06270793a"
+UUID_LA="c9360249-7aa9-4cf0-8edc-4c0362e84b0f"
 LA_INTERNAL="la.internal"
+### ====================
 
-function detect_role() {
-  country=$(curl -s https://ipinfo.io/country || true)
-  if [[ "$country" == "US" ]]; then
-    ROLE="LA"
-  else
-    ROLE="HK"
-  fi
-  echo "[*] Detected role: $ROLE"
+ROLE=""
+OS_CODENAME=""
+
+msg() { echo -e "\033[1;32m[+] $1\033[0m"; }
+err() { echo -e "\033[1;31m[!] $1\033[0m"; }
+
+detect_role() {
+  local c
+  c=$(curl -fsSL https://ipinfo.io/country || true)
+  [[ "$c" == "US" ]] && ROLE="LA" || ROLE="HK"
+  msg "Detected role: $ROLE"
 }
 
-function install_base() {
+detect_os() {
+  . /etc/os-release
+  OS_CODENAME=$VERSION_CODENAME
+  msg "OS: $PRETTY_NAME ($OS_CODENAME)"
+}
+
+install_base() {
   apt update
-  apt install -y curl wget unzip socat jq ca-certificates
+  apt install -y curl wget jq unzip socat ca-certificates gnupg lsb-release
 }
 
-function install_xray() {
+install_xray() {
+  msg "Installing Xray"
   bash <(curl -fsSL https://raw.githubusercontent.com/XTLS/Xray-install/main/install-release.sh)
 }
 
-function install_warp() {
-  curl -fsSL https://pkg.cloudflareclient.com/install.sh | bash
+install_cloudflared() {
+  msg "Installing cloudflared"
+  wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
+  dpkg -i cloudflared-linux-amd64.deb
+}
+
+install_warp() {
+  msg "Installing Cloudflare WARP (stable method)"
+
+  curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
+    | gpg --dearmor \
+    | tee /usr/share/keyrings/cloudflare-warp.gpg >/dev/null
+
+  echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp.gpg] \
+https://pkg.cloudflareclient.com/ ${OS_CODENAME} main" \
+    > /etc/apt/sources.list.d/cloudflare-client.list
+
+  apt update
   apt install -y cloudflare-warp
+
   warp-cli register || true
   warp-cli set-mode proxy
   warp-cli connect || true
 }
 
-function install_cloudflared() {
-  curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb -o cloudflared.deb
-  dpkg -i cloudflared.deb
-}
-
-function setup_tunnel() {
-  mkdir -p /etc/cloudflared
-  echo
-  echo ">>> 请在浏览器中完成 Cloudflare 登录 <<<"
+setup_tunnel() {
+  msg "Cloudflare Tunnel login required"
   cloudflared tunnel login
+
+  mkdir -p /etc/cloudflared
 
   if [[ "$ROLE" == "HK" ]]; then
     cloudflared tunnel create hk-tunnel
@@ -70,17 +93,23 @@ EOF
   fi
 
   systemctl enable cloudflared --now
+
+  systemctl edit cloudflared <<EOF
+[Service]
+Environment=NO_PROXY=127.0.0.1,localhost
+EOF
 }
 
-function setup_xray() {
+setup_xray() {
+  msg "Configuring Xray"
   mkdir -p /usr/local/etc/xray
 
   if [[ "$ROLE" == "LA" ]]; then
 cat > /usr/local/etc/xray/config.json <<EOF
 {
   "inbounds": [{
-    "port": 20000,
     "listen": "127.0.0.1",
+    "port": 20000,
     "protocol": "vless",
     "settings": {
       "clients": [{ "id": "${UUID_LA}" }],
@@ -102,8 +131,8 @@ EOF
 cat > /usr/local/etc/xray/config.json <<EOF
 {
   "inbounds": [{
-    "port": 10000,
     "listen": "127.0.0.1",
+    "port": 10000,
     "protocol": "vless",
     "settings": {
       "clients": [{ "id": "${UUID_HK}" }],
@@ -147,26 +176,28 @@ EOF
   systemctl restart xray
 }
 
-function uninstall_all() {
+uninstall_all() {
+  err "Uninstalling everything"
   systemctl stop xray cloudflared || true
-  apt purge -y xray cloudflared cloudflare-warp || true
+  apt purge -y cloudflare-warp cloudflared || true
   rm -rf /etc/cloudflared /usr/local/etc/xray
-  echo "[*] Uninstalled."
+  err "Done"
 }
 
+### ===== main =====
 case "$1" in
   uninstall)
     uninstall_all
     ;;
   *)
     detect_role
+    detect_os
     install_base
     install_xray
-    install_warp
     install_cloudflared
+    install_warp
     setup_tunnel
     setup_xray
-    echo
-    echo "✅ $ROLE 节点部署完成"
+    msg "$ROLE node deployment finished"
     ;;
 esac
