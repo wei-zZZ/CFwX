@@ -94,8 +94,7 @@ setup_cloudflared() {
   cloudflared tunnel login
 
   if [[ "$ROLE" == "HK" ]]; then
-    cloudflared tunnel list | grep -q hk-tunnel || cloudflared tunnel create hk-tunnel
- || true
+    cloudflared tunnel list | grep -q hk-tunnel || cloudflared tunnel create hk-tunnel || true
     cloudflared tunnel route dns hk-tunnel ${DOMAIN_HK} || warn "DNS record exists, skipped"
 
     cat > /etc/cloudflared/config.yml <<EOF
