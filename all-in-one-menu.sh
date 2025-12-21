@@ -1,63 +1,115 @@
 #!/usr/bin/env bash
 set -e
 
-### ================= 工具函数 =================
-info() { echo -e "\033[32m[INFO]\033[0m $1"; }
-warn() { echo -e "\033[33m[WARN]\033[0m $1"; }
-err()  { echo -e "\033[31m[ERR]\033[0m $1"; }
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[1;33m'
+NC='\033[0m'
+
+info() { echo -e "${GREEN}[INFO]${NC} $1"; }
+warn() { echo -e "${YELLOW}[WARN]${NC} $1"; }
+err()  { echo -e "${RED}[ERR ]${NC} $1"; }
+
+[[ $EUID -ne 0 ]] && err "请用 root 运行" && exit 1
 
 ### ================= 菜单 =================
-echo "=================================="
-echo "1) HK 部署 (Argo + Xray + WARP)"
-echo "2) LA 部署 (Argo + Xray + WARP)"
-echo "3) 卸载（完全清理）"
-echo "=================================="
-read -rp "选择: " MODE
+echo "1) 安装（Argo + Xray WS）"
+echo "2) 卸载（彻底清理）"
+read -rp "选择: " ACTION
 
 ### ================= 卸载 =================
-if [[ "$MODE" == "3" ]]; then
-  info "开始完全卸载"
+if [[ "$ACTION" == "2" ]]; then
+  info "停止服务"
+  systemctl stop xray cloudflared 2>/dev/null || true
+  systemctl disable xray cloudflared 2>/dev/null || true
 
-  systemctl disable --now cloudflared xray 2>/dev/null || true
+  info "删除文件"
+  rm -rf \
+    /usr/local/bin/cloudflared \
+    /etc/cloudflared \
+    /etc/systemd/system/cloudflared.service \
+    /usr/local/bin/xray \
+    /etc/xray \
+    /etc/systemd/system/xray.service \
+    /root/.cloudflared
 
-  rm -rf /etc/cloudflared
-  rm -rf /etc/xray
-  rm -rf /root/.cloudflared
-
-  rm -f /usr/local/bin/cloudflared
-  rm -f /usr/bin/xray
-
-  apt purge -y cloudflare-warp xray 2>/dev/null || true
-  apt autoremove -y
-
-  info "卸载完成（包含 cert.pem / tunnel 配置）"
+  systemctl daemon-reload
+  info "卸载完成"
   exit 0
 fi
 
-### ================= 角色 =================
-if [[ "$MODE" == "1" ]]; then
-  ROLE="HK"
-  TUNNEL_NAME="hk-tunnel"
-elif [[ "$MODE" == "2" ]]; then
-  ROLE="LA"
-  TUNNEL_NAME="la-tunnel"
-else
-  err "无效选择"
-  exit 1
-fi
-
-read -rp "请输入 Argo 域名（如 hk.example.com）: " DOMAIN
+### ================= 输入参数 =================
+read -rp "请输入你的域名（例如 hk.example.com）: " DOMAIN
+[[ -z "$DOMAIN" ]] && err "域名不能为空" && exit 1
 
 UUID=$(cat /proc/sys/kernel/random/uuid)
-WS_PATH="/vless"
-XRAY_PORT=10000
+WS_PATH="/ws-$(openssl rand -hex 4)"
 
-### ================= 基础依赖 =================
+info "UUID: $UUID"
+info "WS PATH: $WS_PATH"
+
+### ================= 安装依赖 =================
 info "安装基础依赖"
-apt update
-apt install -y curl wget ca-certificates gnupg lsb-release
+apt update -y
+apt install -y curl unzip jq ca-certificates
 
-### ================= cloudflared =================
+### ================= 安装 Xray =================
+if ! command -v xray >/dev/null; then
+  info "安装 Xray"
+  curl -fsSL https://github.com/XTLS/Xray-core/releases/latest/download/Xray-linux-64.zip -o /tmp/xray.zip
+  unzip -qo /tmp/xray.zip -d /tmp/xray
+  install -m 755 /tmp/xray/xray /usr/local/bin/xray
+fi
+
+### ================= 配置 Xray =================
+info "配置 Xray"
+mkdir -p /etc/xray
+
+cat > /etc/xray/config.json <<EOF
+{
+  "inbounds": [
+    {
+      "listen": "127.0.0.1",
+      "port": 10000,
+      "protocol": "vless",
+      "settings": {
+        "clients": [
+          { "id": "$UUID", "flow": "" }
+        ],
+        "decryption": "none"
+      },
+      "streamSettings": {
+        "network": "ws",
+        "security": "none",
+        "wsSettings": {
+          "path": "$WS_PATH"
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    { "protocol": "freedom" }
+  ]
+}
+EOF
+
+cat > /etc/systemd/system/xray.service <<EOF
+[Unit]
+Description=Xray Service
+After=network.target
+
+[Service]
+ExecStart=/usr/local/bin/xray -config /etc/xray/config.json
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now xray
+
+### ================= 安装 cloudflared =================
 if ! command -v cloudflared >/dev/null; then
   info "安装 cloudflared（二进制）"
   curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
@@ -66,113 +118,66 @@ if ! command -v cloudflared >/dev/null; then
 fi
 
 ### ================= Cloudflare 登录 =================
-if [ ! -f /root/.cloudflared/cert.pem ]; then
-  info "请在浏览器完成 Cloudflare 登录"
+if [[ ! -f /root/.cloudflared/cert.pem ]]; then
+  warn "请进行 Cloudflare 登录（浏览器）"
   cloudflared tunnel login
 fi
 
-### ================= Tunnel =================
-if ! cloudflared tunnel list | grep -q "$TUNNEL_NAME"; then
-  cloudflared tunnel create "$TUNNEL_NAME"
+### ================= 创建 Tunnel =================
+TUNNEL_NAME="argo-xray"
+TUNNEL_ID=$(cloudflared tunnel list | awk "/$TUNNEL_NAME/ {print \$1}")
+
+if [[ -z "$TUNNEL_ID" ]]; then
+  info "创建 Tunnel"
+  TUNNEL_ID=$(cloudflared tunnel create "$TUNNEL_NAME" | awk '{print $NF}')
 fi
 
-cloudflared tunnel route dns "$TUNNEL_NAME" "$DOMAIN" || true
-
-TUNNEL_ID=$(cloudflared tunnel list | grep "$TUNNEL_NAME" | awk '{print $1}')
+info "Tunnel ID: $TUNNEL_ID"
 
 mkdir -p /etc/cloudflared
-cat >/etc/cloudflared/config.yml <<EOF
+cp /root/.cloudflared/${TUNNEL_ID}.json /etc/cloudflared/
+
+cat > /etc/cloudflared/config.yml <<EOF
 tunnel: $TUNNEL_ID
-credentials-file: /root/.cloudflared/${TUNNEL_ID}.json
+credentials-file: /etc/cloudflared/${TUNNEL_ID}.json
 
 ingress:
   - hostname: $DOMAIN
-    service: http://127.0.0.1:${XRAY_PORT}
+    service: http://127.0.0.1:10000
   - service: http_status:404
 EOF
 
-cloudflared service install || true
-systemctl restart cloudflared
-systemctl enable cloudflared
+cloudflared tunnel route dns "$TUNNEL_NAME" "$DOMAIN" || true
 
-### ================= Xray =================
-if ! command -v xray >/dev/null; then
-  info "安装 Xray"
-  bash <(curl -fsSL https://github.com/XTLS/Xray-install/raw/main/install-release.sh)
-fi
+cat > /etc/systemd/system/cloudflared.service <<EOF
+[Unit]
+Description=Cloudflare Tunnel
+After=network.target
 
-mkdir -p /etc/xray
-cat >/etc/xray/config.json <<EOF
-{
-  "log": { "loglevel": "warning" },
-  "inbounds": [
-    {
-      "listen": "127.0.0.1",
-      "port": ${XRAY_PORT},
-      "protocol": "vless",
-      "settings": {
-        "clients": [{ "id": "${UUID}" }],
-        "decryption": "none"
-      },
-      "streamSettings": {
-        "network": "ws",
-        "wsSettings": {
-          "path": "${WS_PATH}"
-        }
-      }
-    }
-  ],
-  "outbounds": [
-    {
-      "tag": "warp",
-      "protocol": "socks",
-      "settings": {
-        "servers": [
-          { "address": "127.0.0.1", "port": 40000 }
-        ]
-      }
-    },
-    {
-      "tag": "direct",
-      "protocol": "freedom"
-    }
-  ],
-  "routing": {
-    "rules": [
-      {
-        "type": "field",
-        "geoip": ["us"],
-        "outboundTag": "warp"
-      },
-      {
-        "type": "field",
-        "outboundTag": "direct"
-      }
-    ]
-  }
-}
+[Service]
+ExecStart=/usr/local/bin/cloudflared tunnel run
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
 EOF
 
-systemctl restart xray
-systemctl enable xray
-
-### ================= WARP =================
-if ! command -v warp-cli >/dev/null; then
-  info "安装 WARP"
-  curl -fsSL https://pkg.cloudflareclient.com/install.sh | bash
-  apt install -y cloudflare-warp
-fi
-
-info "启动 WARP（只 connect）"
-warp-cli connect || true
+systemctl daemon-reload
+systemctl enable --now cloudflared
 
 ### ================= 输出节点 =================
 echo
-echo "=========================================="
-echo "$ROLE 节点部署完成（WS + 正确 SNI）"
+echo "================= 节点信息 ================="
+echo "协议: VLESS"
+echo "地址: $DOMAIN"
+echo "端口: 443"
+echo "UUID: $UUID"
+echo "加密: none"
+echo "传输: WS"
+echo "WS 路径: $WS_PATH"
+echo "SNI / Host: $DOMAIN"
+echo "TLS: 开"
 echo
-echo "VLESS 节点链接："
-echo
-echo "vless://${UUID}@${DOMAIN}:443?encryption=none&security=tls&type=ws&host=${DOMAIN}&sni=${DOMAIN}&path=%2Fvless#Argo-${ROLE}"
-echo
-echo "=========================================="
+echo "VLESS 链接："
+echo "vless://$UUID@$DOMAIN:443?encryption=none&security=tls&type=ws&host=$DOMAIN&path=$WS_PATH#Argo-WS"
+echo "==========================================="
