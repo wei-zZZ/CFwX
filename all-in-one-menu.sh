@@ -73,9 +73,38 @@ apt install -y curl unzip nginx
 
 ### ---------- cloudflared ----------
 if ! command -v cloudflared >/dev/null; then
-  info "安装 cloudflared"
-  curl -fsSL https://pkg.cloudflare.com/install.sh | bash
-  apt install -y cloudflared
+  info "install_cloudflared"
+install_cloudflared() {
+  if command -v cloudflared >/dev/null; then
+    info "cloudflared already installed"
+    return
+  fi
+
+  info "Installing cloudflared (static binary)"
+
+  ARCH=$(uname -m)
+  case "$ARCH" in
+    x86_64)  BIN_ARCH="amd64" ;;
+    aarch64) BIN_ARCH="arm64" ;;
+    *) err "Unsupported arch: $ARCH"; exit 1 ;;
+  esac
+
+  TMP_DIR=$(mktemp -d)
+  cd "$TMP_DIR"
+
+  curl -fL \
+    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${BIN_ARCH}" \
+    -o cloudflared
+
+  chmod +x cloudflared
+  mv cloudflared /usr/bin/cloudflared
+
+  cd /
+  rm -rf "$TMP_DIR"
+
+  info "cloudflared installed: $(cloudflared --version)"
+}
+
 fi
 
 ### ---------- Cloudflare 登录 ----------
