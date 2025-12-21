@@ -2,8 +2,8 @@
 set -e
 
 ### ===== 用户需要修改的变量 =====
-DOMAIN_HK="hkkkin.9420ce.top"
-LA_INTERNAL="laaaing"
+DOMAIN_HK="hkkkkin.9420ce.top"
+LA_INTERNAL="laaaaing"
 
 UUID_HK="15e82e74-d472-4f24-827f-d61b434ebb4a"
 UUID_LA="15e82e74-d472-4f24-827f-d61b434ebb4b"
@@ -26,7 +26,7 @@ detect_os() {
 
 install_base() {
   apt update
-  apt install -y curl wget jq ca-certificates gnupg lsb-release python3
+  apt install -y curl wget jq ca-certificates gnupg lsb-release
 }
 
 install_singbox() {
@@ -45,9 +45,11 @@ install_warp() {
   curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
     | gpg --dearmor \
     | tee /usr/share/keyrings/cloudflare-warp.gpg >/dev/null
+
   echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp.gpg] \
 https://pkg.cloudflareclient.com/ ${OS_CODENAME} main" \
     > /etc/apt/sources.list.d/cloudflare-warp.list
+
   apt update && apt install -y cloudflare-warp || true
 }
 
@@ -65,6 +67,7 @@ start_warp() {
 
 setup_cloudflared() {
   mkdir -p /etc/cloudflared
+
   cloudflared tunnel login
 
   if [[ "$ROLE" == "HK" ]]; then
@@ -73,20 +76,34 @@ setup_cloudflared() {
     PORT=10000
   else
     NAME="la-tunnel"
-    HOST="la.internal"
+    HOST="$LA_INTERNAL"
     PORT=20000
   fi
 
-  cloudflared tunnel list | grep -q "$NAME" || cloudflared tunnel create "$NAME" || true
+  TUNNEL_ID=$(cloudflared tunnel list | awk -v n="$NAME" '$2==n {print $1}')
+
+  if [[ -z "$TUNNEL_ID" ]]; then
+    cloudflared tunnel create "$NAME"
+    TUNNEL_ID=$(cloudflared tunnel list | awk -v n="$NAME" '$2==n {print $1}')
+  fi
+
+  SRC="/root/.cloudflared/${TUNNEL_ID}.json"
+  DST="/etc/cloudflared/${TUNNEL_ID}.json"
+
+  if [[ ! -f "$DST" ]]; then
+    if [[ -f "$SRC" ]]; then
+      cp "$SRC" "$DST"
+    else
+      warn "Tunnel json missing, recreating credential"
+      cloudflared tunnel create "$NAME" --credentials-file "$DST" || true
+    fi
+  fi
+
   cloudflared tunnel route dns "$NAME" "$HOST" || warn "DNS exists, skipped"
 
-  TOKEN_FILE="/etc/cloudflared/token.json"
-  cloudflared tunnel token "$NAME" > "$TOKEN_FILE"
-  chmod 600 "$TOKEN_FILE"
-
   cat > /etc/cloudflared/config.yml <<EOF
-tunnel: ${NAME}
-credentials-file: ${TOKEN_FILE}
+tunnel: ${TUNNEL_ID}
+credentials-file: ${DST}
 
 ingress:
   - hostname: ${HOST}
@@ -120,7 +137,7 @@ cat > /etc/sing-box/config.json <<EOF
     {
       "type":"vless",
       "tag":"to-la",
-      "server":"la.internal",
+      "server":"${LA_INTERNAL}",
       "server_port":443,
       "uuid":"${UUID_LA}"
     }
@@ -144,38 +161,15 @@ EOF
   systemctl enable sing-box --now
 }
 
-setup_subscription() {
-  [[ "$ROLE" != "HK" ]] && return
-
-  mkdir -p /var/www/sub
-cat > /var/www/sub/config.json <<EOF
-{
-  "outbounds":[{
-    "type":"vless",
-    "server":"${DOMAIN_HK}",
-    "server_port":443,
-    "uuid":"${UUID_HK}",
-    "tls":{"enabled":true},
-    "transport":{"type":"ws","path":"/"}
-  }]
-}
-EOF
-
-cat > /var/www/sub/server.py <<EOF
-from http.server import HTTPServer, SimpleHTTPRequestHandler
-import os
-os.chdir("/var/www/sub")
-HTTPServer(("127.0.0.1", 8080), SimpleHTTPRequestHandler).serve_forever()
-EOF
-
-  nohup python3 /var/www/sub/server.py >/dev/null 2>&1 &
+uninstall_all() {
+  systemctl stop sing-box cloudflared || true
+  apt purge -y sing-box cloudflared cloudflare-warp || true
+  rm -rf /etc/sing-box /etc/cloudflared
 }
 
 case "$1" in
   uninstall)
-    systemctl stop sing-box cloudflared || true
-    apt purge -y sing-box cloudflared cloudflare-warp || true
-    rm -rf /etc/sing-box /etc/cloudflared /var/www/sub
+    uninstall_all
     ;;
   *)
     detect_role
@@ -187,7 +181,6 @@ case "$1" in
     start_warp
     setup_cloudflared
     setup_singbox
-    setup_subscription
-    log "All done ($ROLE)"
+    log "Deployment completed successfully ($ROLE)"
     ;;
 esac
