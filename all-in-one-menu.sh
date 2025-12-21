@@ -34,28 +34,21 @@ install_cloudflared() {
     return
   fi
 
-  green "[INFO] 安装 cloudflared"
+  green "[INFO] 使用官方二进制安装 cloudflared（推荐）"
 
-  CODENAME=$(grep VERSION_CODENAME /etc/os-release | cut -d= -f2)
+  ARCH=$(uname -m)
+  case "$ARCH" in
+    x86_64|amd64) BIN="cloudflared-linux-amd64" ;;
+    aarch64|arm64) BIN="cloudflared-linux-arm64" ;;
+    *)
+      red "不支持的架构: $ARCH"
+      exit 1
+      ;;
+  esac
 
-  mkdir -p /etc/apt/keyrings || true
-
-  if curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
-      -o /etc/apt/keyrings/cloudflare.gpg; then
-
-    echo "deb [signed-by=/etc/apt/keyrings/cloudflare.gpg] https://pkg.cloudflare.com/cloudflared ${CODENAME} main" \
-      > /etc/apt/sources.list.d/cloudflared.list
-
-    apt update
-    if apt install -y cloudflared; then
-      return
-    fi
-  fi
-
-  yellow "[WARN] apt 安装失败，回退二进制方式"
-
-  curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+  curl -L "https://github.com/cloudflare/cloudflared/releases/latest/download/${BIN}" \
     -o /usr/local/bin/cloudflared
+
   chmod +x /usr/local/bin/cloudflared
 
   cat >/etc/systemd/system/cloudflared.service <<'EOF'
@@ -65,7 +58,7 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/cloudflared tunnel run
+ExecStart=/usr/local/bin/cloudflared --no-autoupdate tunnel run
 Restart=on-failure
 User=root
 
@@ -75,6 +68,7 @@ EOF
 
   systemctl daemon-reload
 }
+
 
 ############################
 # Cloudflare 登录（只提示）
