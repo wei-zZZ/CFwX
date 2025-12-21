@@ -12,8 +12,7 @@ err()  { echo -e "${RED}[ERR ]${NC} $1"; }
 
 [[ $EUID -ne 0 ]] && err "请用 root 运行" && exit 1
 
-### ================= 菜单 =================
-echo "1) 安装（Argo + Xray WS）"
+echo "1) 安装 Argo + Xray (WS)"
 echo "2) 卸载（彻底清理）"
 read -rp "选择: " ACTION
 
@@ -26,10 +25,10 @@ if [[ "$ACTION" == "2" ]]; then
   info "删除文件"
   rm -rf \
     /usr/local/bin/cloudflared \
-    /etc/cloudflared \
-    /etc/systemd/system/cloudflared.service \
     /usr/local/bin/xray \
+    /etc/cloudflared \
     /etc/xray \
+    /etc/systemd/system/cloudflared.service \
     /etc/systemd/system/xray.service \
     /root/.cloudflared
 
@@ -38,17 +37,17 @@ if [[ "$ACTION" == "2" ]]; then
   exit 0
 fi
 
-### ================= 输入参数 =================
-read -rp "请输入你的域名（例如 hk.example.com）: " DOMAIN
+### ================= 输入域名 =================
+read -rp "请输入你的域名（如 hk.example.com）: " DOMAIN
 [[ -z "$DOMAIN" ]] && err "域名不能为空" && exit 1
 
 UUID=$(cat /proc/sys/kernel/random/uuid)
 WS_PATH="/ws-$(openssl rand -hex 4)"
 
 info "UUID: $UUID"
-info "WS PATH: $WS_PATH"
+info "WS Path: $WS_PATH"
 
-### ================= 安装依赖 =================
+### ================= 依赖 =================
 info "安装基础依赖"
 apt update -y
 apt install -y curl unzip jq ca-certificates
@@ -74,7 +73,7 @@ cat > /etc/xray/config.json <<EOF
       "protocol": "vless",
       "settings": {
         "clients": [
-          { "id": "$UUID", "flow": "" }
+          { "id": "$UUID" }
         ],
         "decryption": "none"
       },
@@ -109,9 +108,9 @@ EOF
 systemctl daemon-reload
 systemctl enable --now xray
 
-### ================= 安装 cloudflared =================
+### ================= 安装 cloudflared（二进制） =================
 if ! command -v cloudflared >/dev/null; then
-  info "安装 cloudflared（二进制）"
+  info "安装 cloudflared"
   curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
     -o /usr/local/bin/cloudflared
   chmod +x /usr/local/bin/cloudflared
@@ -119,27 +118,30 @@ fi
 
 ### ================= Cloudflare 登录 =================
 if [[ ! -f /root/.cloudflared/cert.pem ]]; then
-  warn "请进行 Cloudflare 登录（浏览器）"
+  warn "请进行 Cloudflare 登录（浏览器打开）"
   cloudflared tunnel login
 fi
 
-### ================= 创建 Tunnel =================
+### ================= 创建 Tunnel（修正版） =================
 TUNNEL_NAME="argo-xray"
-TUNNEL_ID=$(cloudflared tunnel list | awk "/$TUNNEL_NAME/ {print \$1}")
+CRED_FILE="/etc/cloudflared/${TUNNEL_NAME}.json"
+mkdir -p /etc/cloudflared
 
-if [[ -z "$TUNNEL_ID" ]]; then
-  info "创建 Tunnel"
-  TUNNEL_ID=$(cloudflared tunnel create "$TUNNEL_NAME" | awk '{print $NF}')
+if ! cloudflared tunnel list | grep -q "$TUNNEL_NAME"; then
+  info "创建 Tunnel（指定 credentials-file）"
+  cloudflared tunnel create "$TUNNEL_NAME" \
+    --credentials-file "$CRED_FILE"
+else
+  info "Tunnel 已存在"
 fi
 
+TUNNEL_ID=$(cloudflared tunnel list | awk "/$TUNNEL_NAME/ {print \$1}")
 info "Tunnel ID: $TUNNEL_ID"
 
-mkdir -p /etc/cloudflared
-cp /root/.cloudflared/${TUNNEL_ID}.json /etc/cloudflared/
-
+### ================= cloudflared 配置 =================
 cat > /etc/cloudflared/config.yml <<EOF
 tunnel: $TUNNEL_ID
-credentials-file: /etc/cloudflared/${TUNNEL_ID}.json
+credentials-file: $CRED_FILE
 
 ingress:
   - hostname: $DOMAIN
