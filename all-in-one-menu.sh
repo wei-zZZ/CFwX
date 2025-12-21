@@ -1,203 +1,142 @@
 #!/usr/bin/env bash
 set -e
 
-### ---------- 工具函数 ----------
-info(){ echo -e "\033[32m[INFO]\033[0m $*"; }
-warn(){ echo -e "\033[33m[WARN]\033[0m $*"; }
-err(){  echo -e "\033[31m[ERR ]\033[0m $*"; }
-pause(){ read -rp "按回车继续..." ; }
+### ===== 基础变量（可修改） =====
+DOMAIN="example.com"
+HK_SUB="hk.${DOMAIN}"
+LA_SUB="la.${DOMAIN}"
 
-[ "$(id -u)" -eq 0 ] || { err "请使用 root 运行"; exit 1; }
+HK_TUNNEL_NAME="hk-tunnel"
+LA_TUNNEL_NAME="la-tunnel"
 
-### ---------- 菜单 ----------
+SB_PORT_SOCKS=1080
+SB_PORT_HTTP=2080
+
+SUB_DIR="/var/www/sub"
+SUB_PORT=8088
+
+### ===== 颜色 =====
+green(){ echo -e "\033[32m$*\033[0m"; }
+red(){ echo -e "\033[31m$*\033[0m"; }
+yellow(){ echo -e "\033[33m$*\033[0m"; }
+
+### ===== 菜单 =====
 echo
-echo "请选择操作："
-echo "1) 安装 HK 节点"
-echo "2) 安装 LA 节点"
-echo "3) 完整卸载（cloudflared + sing-box + WARP）"
-echo
-read -rp "请输入选项 [1-3]: " MODE
+echo "1) HK 安装"
+echo "2) LA 安装"
+echo "3) 卸载全部"
+read -p "请选择: " MODE
 
-case "$MODE" in
-  1) ROLE="HK" ;;
-  2) ROLE="LA" ;;
-  3) ROLE="UNINSTALL" ;;
-  *) err "无效选项"; exit 1 ;;
-esac
+### ===== 卸载 =====
+if [[ "$MODE" == "3" ]]; then
+  systemctl stop cloudflared sing-box || true
+  systemctl disable cloudflared sing-box || true
 
-### ---------- 卸载逻辑 ----------
-if [ "$ROLE" = "UNINSTALL" ]; then
-  info "开始完整卸载"
+  rm -rf /etc/cloudflared /root/.cloudflared
+  rm -rf /etc/sing-box /usr/local/bin/sing-box
+  rm -rf "$SUB_DIR"
 
-  systemctl stop cloudflared sing-box warp-svc 2>/dev/null || true
-  systemctl disable cloudflared sing-box warp-svc 2>/dev/null || true
-
-  cloudflared service uninstall 2>/dev/null || true
-
-  rm -rf /etc/cloudflared
-  rm -rf /root/.cloudflared        # ← 包含 cert.pem
-  rm -rf /etc/sing-box
-  rm -rf /var/www/sub
-
-  apt purge -y cloudflared sing-box cloudflare-warp nginx 2>/dev/null || true
-  apt autoremove -y
-
-  info "卸载完成，系统已恢复干净状态"
+  apt purge -y cloudflared || true
+  green "已彻底卸载"
   exit 0
 fi
 
-### ---------- 参数输入 ----------
-echo
-read -rp "Tunnel 名称 [hk-tunnel]: " TUNNEL_NAME
-TUNNEL_NAME=${TUNNEL_NAME:-hk-tunnel}
+### ===== 输入参数 =====
+read -p "请输入域名（默认 ${DOMAIN}）: " INPUT_DOMAIN
+DOMAIN=${INPUT_DOMAIN:-$DOMAIN}
 
-read -rp "HK 入口域名 (如 hk.example.com): " DOMAIN_HK
-[ -z "$DOMAIN_HK" ] && { err "域名不能为空"; exit 1; }
-
-read -rp "LA 内网域名 (如 la.internal.example.com): " DOMAIN_LA
-[ -z "$DOMAIN_LA" ] && { err "LA 域名不能为空"; exit 1; }
-
-read -rp "sing-box 本地监听端口 [10000]: " LISTEN_PORT
-LISTEN_PORT=${LISTEN_PORT:-10000}
-
-read -rp "是否安装 WARP 出口？[Y/n]: " INSTALL_WARP
-INSTALL_WARP=${INSTALL_WARP:-Y}
-
-read -rp "是否生成订阅并用 nginx 提供？[Y/n]: " INSTALL_SUB
-INSTALL_SUB=${INSTALL_SUB:-Y}
-
-### ---------- 依赖 ----------
-info "安装基础依赖"
+### ===== 安装依赖 =====
 apt update
-apt install -y curl unzip nginx
+apt install -y curl wget unzip nginx python3
 
-### ---------- cloudflared ----------
-if ! command -v cloudflared >/dev/null; then
-  info "install_cloudflared"
-install_cloudflared() {
-  if command -v cloudflared >/dev/null; then
-    info "cloudflared already installed"
-    return
-  fi
-
-  info "Installing cloudflared (static binary)"
-
-  ARCH=$(uname -m)
-  case "$ARCH" in
-    x86_64)  BIN_ARCH="amd64" ;;
-    aarch64) BIN_ARCH="arm64" ;;
-    *) err "Unsupported arch: $ARCH"; exit 1 ;;
-  esac
-
-  TMP_DIR=$(mktemp -d)
-  cd "$TMP_DIR"
-
-  curl -fL \
-    "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-${BIN_ARCH}" \
-    -o cloudflared
-
-  chmod +x cloudflared
-  mv cloudflared /usr/bin/cloudflared
-
-  cd /
-  rm -rf "$TMP_DIR"
-
-  info "cloudflared installed: $(cloudflared --version)"
-}
-
+### ===== sing-box =====
+if ! command -v sing-box >/dev/null; then
+  curl -fsSL https://sing-box.app/install.sh | bash
 fi
 
-### ---------- Cloudflare 登录 ----------
+mkdir -p /etc/sing-box
+
+### ===== WARP =====
+if ! command -v warp-cli >/dev/null; then
+  curl -fsSL https://pkg.cloudflareclient.com/install.sh | bash
+  apt install -y cloudflare-warp || true
+fi
+
+warp-cli registration new || true
+warp-cli mode proxy || true
+warp-cli connect || true
+
+### ===== cloudflared =====
+if ! command -v cloudflared >/dev/null; then
+  apt install -y cloudflared
+fi
+
 if [ ! -f /root/.cloudflared/cert.pem ]; then
-  info "需要 Cloudflare 登录"
+  yellow "请完成 Cloudflare 登录"
   cloudflared tunnel login
 fi
 
-### ---------- Tunnel ----------
-if ! cloudflared tunnel list | grep -q "$TUNNEL_NAME"; then
-  info "创建 Tunnel: $TUNNEL_NAME"
-  cloudflared tunnel create "$TUNNEL_NAME"
+### ===== 角色判断 =====
+if [[ "$MODE" == "1" ]]; then
+  ROLE="HK"
+  TUNNEL_NAME="$HK_TUNNEL_NAME"
+  HOSTNAME="$HK_SUB"
 else
-  info "Tunnel 已存在"
+  ROLE="LA"
+  TUNNEL_NAME="$LA_TUNNEL_NAME"
+  HOSTNAME="$LA_SUB"
 fi
 
-TUNNEL_ID=$(cloudflared tunnel list | awk "/$TUNNEL_NAME/ {print \$1}")
-CFG_DIR="/etc/cloudflared"
-CREDS="$CFG_DIR/$TUNNEL_ID.json"
-mkdir -p "$CFG_DIR"
-
-if [ ! -f "$CREDS" ]; then
-  info "生成 tunnel credentials"
-  cloudflared tunnel run "$TUNNEL_NAME" --credentials-file "$CREDS" &
-  sleep 3
-  pkill cloudflared || true
+### ===== Tunnel =====
+if ! cloudflared tunnel list | grep -qw "$TUNNEL_NAME"; then
+  cloudflared tunnel create "$TUNNEL_NAME"
 fi
 
-### ---------- DNS ----------
-cloudflared tunnel route dns "$TUNNEL_NAME" "$DOMAIN_HK" || true
-cloudflared tunnel route dns "$TUNNEL_NAME" "$DOMAIN_LA" || true
+TUNNEL_ID=$(cloudflared tunnel list | awk "/$TUNNEL_NAME/{print \$1}")
 
-### ---------- cloudflared config ----------
-cat > $CFG_DIR/config.yml <<EOF
+mkdir -p /etc/cloudflared
+cp "/root/.cloudflared/${TUNNEL_ID}.json" /etc/cloudflared/
+
+cloudflared tunnel route dns "$TUNNEL_NAME" "$HOSTNAME" || true
+
+cat >/etc/cloudflared/config.yml <<EOF
 tunnel: $TUNNEL_ID
-credentials-file: $CREDS
+credentials-file: /etc/cloudflared/${TUNNEL_ID}.json
 
 ingress:
-  - hostname: $DOMAIN_HK
-    service: http://127.0.0.1:$LISTEN_PORT
-  - hostname: $DOMAIN_LA
-    service: http://127.0.0.1:$LISTEN_PORT
+  - hostname: $HOSTNAME
+    service: http://127.0.0.1:${SB_PORT_HTTP}
   - service: http_status:404
 EOF
 
 cloudflared service install
 systemctl restart cloudflared
 
-### ---------- sing-box ----------
-if ! command -v sing-box >/dev/null; then
-  info "安装 sing-box"
-  curl -fsSL https://sing-box.app/install.sh | bash
-fi
-
-mkdir -p /etc/sing-box
-
-### ---------- WARP ----------
-if [[ "$INSTALL_WARP" =~ ^[Yy]$ ]]; then
-  if ! command -v warp-cli >/dev/null; then
-    curl -fsSL https://pkg.cloudflareclient.com/install.sh | bash
-    apt install -y cloudflare-warp || true
-  fi
-  warp-cli registration new || true
-  warp-cli mode proxy || true
-  warp-cli connect || true
-  WARP_OUT='"warp"'
-else
-  WARP_OUT='"direct"'
-fi
-
-### ---------- sing-box config ----------
-cat > /etc/sing-box/config.json <<EOF
+### ===== sing-box 配置 =====
+cat >/etc/sing-box/config.json <<EOF
 {
-  "log": { "level": "info" },
-  "inbounds": [{
-    "type": "http",
-    "listen": "127.0.0.1",
-    "listen_port": $LISTEN_PORT
-  }],
+  "inbounds": [
+    { "type": "socks", "listen": "127.0.0.1", "listen_port": $SB_PORT_SOCKS },
+    { "type": "http",  "listen": "127.0.0.1", "listen_port": $SB_PORT_HTTP }
+  ],
   "outbounds": [
-    { "type": "direct", "tag": "direct" },
     {
-      "type": "socks",
+      "type": "wireguard",
       "tag": "warp",
-      "server": "127.0.0.1",
-      "server_port": 40000
+      "server": "engage.cloudflareclient.com",
+      "server_port": 2408,
+      "local_address": [
+        "172.16.0.2/32",
+        "2606:4700:110:8a36:df92:102a:9602:fa18/128"
+      ],
+      "private_key": "PLACEHOLDER",
+      "peer_public_key": "bmXOC+F1Tq7l...",
+      "reserved": [0,0,0],
+      "mtu": 1280
     }
   ],
   "route": {
-    "rules": [
-      { "domain_suffix": ["google.com","openai.com"], "outbound": $WARP_OUT }
-    ],
-    "final": "direct"
+    "final": "warp"
   }
 }
 EOF
@@ -205,27 +144,33 @@ EOF
 systemctl enable sing-box
 systemctl restart sing-box
 
-### ---------- 订阅 ----------
-if [[ "$INSTALL_SUB" =~ ^[Yy]$ ]]; then
-  mkdir -p /var/www/sub
-  cat > /var/www/sub/sing-box.json <<EOF
+### ===== 订阅 =====
+mkdir -p "$SUB_DIR"
+cat >"$SUB_DIR/singbox.json" <<EOF
 {
-  "type": "http",
-  "server": "$DOMAIN_HK",
-  "port": 443
+  "server": "$HOSTNAME",
+  "type": "http"
 }
 EOF
 
-  cat > /etc/nginx/conf.d/sub.conf <<EOF
-server {
-  listen 80;
-  root /var/www/sub;
-  location / { autoindex on; }
-}
+cat >"$SUB_DIR/clash.yaml" <<EOF
+proxies:
+  - name: $ROLE
+    type: http
+    server: $HOSTNAME
+    port: 443
 EOF
 
-  systemctl restart nginx
-  info "订阅地址: http://$DOMAIN_HK/sing-box.json"
-fi
+cat >"$SUB_DIR/sr.conf" <<EOF
+$ROLE = http, $HOSTNAME, 443
+EOF
 
-info "🎉 安装完成：$ROLE 节点"
+python3 -m http.server "$SUB_PORT" --directory "$SUB_DIR" &
+
+green "================================"
+green "$ROLE 节点部署完成"
+green "订阅地址："
+green "http://$HOSTNAME:$SUB_PORT/singbox.json"
+green "http://$HOSTNAME:$SUB_PORT/clash.yaml"
+green "http://$HOSTNAME:$SUB_PORT/sr.conf"
+green "================================"
