@@ -2,7 +2,7 @@
 set -e
 
 ROLE=""
-DOMAIN_HK="hk.your-domain.com"
+DOMAIN_HK="hkin.9420ce.top"
 LA_INTERNAL="la.internal"
 
 UUID_HK="15e82e74-d472-4f24-827f-d61b434ebb4a"
