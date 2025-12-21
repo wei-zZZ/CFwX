@@ -1,196 +1,100 @@
 #!/usr/bin/env bash
 set -e
-export DEBIAN_FRONTEND=noninteractive
 
-### ===== 颜色 =====
-ok(){ echo -e "\033[32m[OK]\033[0m $*"; }
-warn(){ echo -e "\033[33m[WARN]\033[0m $*"; }
-die(){ echo -e "\033[31m[ERR]\033[0m $*"; exit 1; }
+### ===== 参数 =====
+ROLE=""
+DOMAIN=""
+TUNNEL_NAME=""
+UUID=$(cat /proc/sys/kernel/random/uuid)
+PORT=3000
 
-### ===== 菜单 =====
-echo "=============================="
-echo "1) HK 节点部署"
-echo "2) LA 节点部署"
-echo "3) 完全卸载"
-echo "=============================="
-read -p "请选择: " MODE
+### ===== 选择 =====
+echo "1) HK"
+echo "2) LA"
+read -rp "选择节点类型: " C
 
-### ===== 卸载 =====
-if [[ "$MODE" == "3" ]]; then
-  warn "开始完全卸载"
-
-  systemctl stop sing-box cloudflared nginx 2>/dev/null || true
-  systemctl disable sing-box cloudflared nginx 2>/dev/null || true
-
-  dpkg -l | grep -q sing-box && apt purge -y sing-box
-  dpkg -l | grep -q cloudflared && apt purge -y cloudflared
-  dpkg -l | grep -q cloudflare-warp && apt purge -y cloudflare-warp
-  dpkg -l | grep -q nginx && apt purge -y nginx
-
-  rm -rf /etc/sing-box /etc/cloudflared /root/.cloudflared \
-         /etc/nginx /var/log/nginx
-
-  ok "卸载完成（含 cert.pem）"
-  exit 0
-fi
-
-### ===== 用户输入（必须有）=====
-read -p "请输入 Cloudflare 上的域名（如 hk.example.com）: " DOMAIN
-[[ -z "$DOMAIN" ]] && die "域名不能为空"
-
-### ===== 修复 APT 源 =====
-ok "修复 Debian APT 源"
-. /etc/os-release
-
-if [[ "$VERSION_CODENAME" == "bullseye" ]]; then
-cat >/etc/apt/sources.list <<EOF
-deb http://deb.debian.org/debian bullseye main
-deb http://deb.debian.org/debian bullseye-updates main
-deb http://security.debian.org/debian-security bullseye-security main
-EOF
+if [[ "$C" == "1" ]]; then
+  ROLE="HK"
+  TUNNEL_NAME="hk-tunnel"
+elif [[ "$C" == "2" ]]; then
+  ROLE="LA"
+  TUNNEL_NAME="la-tunnel"
 else
-cat >/etc/apt/sources.list <<EOF
-deb http://deb.debian.org/debian bookworm main
-deb http://deb.debian.org/debian bookworm-updates main
-deb http://security.debian.org/debian-security bookworm-security main
-EOF
+  exit 1
 fi
 
-apt clean
-apt update
+read -rp "输入 Tunnel 域名（如 hk.xxx.com）: " DOMAIN
 
-### ===== 基础依赖 =====
-ok "安装基础依赖"
-apt install -y curl wget ca-certificates gnupg lsb-release nginx apache2-utils
+### ===== 依赖 =====
+apt update
+apt install -y curl wget ca-certificates
 
 ### ===== sing-box =====
 if ! command -v sing-box >/dev/null; then
-  ok "安装 sing-box"
   curl -fsSL https://sing-box.app/install.sh | bash
-else
-  ok "sing-box 已存在"
 fi
 
-### ===== WARP（新命令）=====
-ok "安装 WARP"
-if command -v warp-cli >/dev/null; then
-  warp-cli disconnect || true
-  warp-cli registration delete || true
+### ===== WARP =====
+if ! command -v warp-cli >/dev/null; then
+  curl -fsSL https://pkg.cloudflareclient.com/install.sh | bash
+  apt install -y cloudflare-warp
 fi
-
-curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
- | gpg --dearmor -o /usr/share/keyrings/cloudflare-warp.gpg
-
-echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp.gpg] \
-https://pkg.cloudflareclient.com $(lsb_release -cs) main" \
->/etc/apt/sources.list.d/cloudflare-warp.list
-
-apt update
-apt install -y cloudflare-warp
-
-warp-cli registration new
-warp-cli set-mode proxy
-warp-cli connect
+warp-cli connect || true
 
 ### ===== cloudflared =====
-ok "安装 cloudflared"
 if ! command -v cloudflared >/dev/null; then
-  curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
-   | gpg --dearmor -o /usr/share/keyrings/cloudflare.gpg
-
-  echo "deb [signed-by=/usr/share/keyrings/cloudflare.gpg] \
-https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" \
-  >/etc/apt/sources.list.d/cloudflared.list
-
-  apt update
-  apt install -y cloudflared
+  curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+    -o /usr/local/bin/cloudflared
+  chmod +x /usr/local/bin/cloudflared
 fi
 
-### ===== Cloudflare 登录 =====
-if [[ ! -f /root/.cloudflared/cert.pem ]]; then
-  warn "请完成 Cloudflare 登录（浏览器）"
+### ===== 登录 =====
+if [ ! -f ~/.cloudflared/cert.pem ]; then
+  echo ">>> 请登录 Cloudflare"
   cloudflared tunnel login
-  read -p "登录完成后按 Enter 继续"
 fi
+
+### ===== Tunnel =====
+cloudflared tunnel list | grep -q "$TUNNEL_NAME" || cloudflared tunnel create "$TUNNEL_NAME"
+cloudflared tunnel route dns "$TUNNEL_NAME" "$DOMAIN"
+
+TUNNEL_ID=$(cloudflared tunnel list | grep "$TUNNEL_NAME" | awk '{print $1}')
 
 ### ===== sing-box 配置 =====
-ok "配置 sing-box"
 mkdir -p /etc/sing-box
-
 cat >/etc/sing-box/config.json <<EOF
 {
-  "inbounds": [{
-    "type": "mixed",
-    "listen": "127.0.0.1",
-    "listen_port": 3000
-  }],
-  "outbounds": [
-    { "type": "direct", "tag": "direct" },
-    { "type": "socks", "tag": "warp", "server": "127.0.0.1", "server_port": 40000 }
+  "inbounds": [
+    {
+      "type": "vless",
+      "listen": "127.0.0.1",
+      "listen_port": $PORT,
+      "users": [
+        { "uuid": "$UUID", "flow": "" }
+      ]
+    }
   ],
-  "route": {
-    "rules": [
-      { "geoip": "us", "outbound": "warp" },
-      { "geoip": ["jp","sg","hk","tw"], "outbound": "direct" }
-    ]
-  }
+  "outbounds": [
+    {
+      "type": "socks",
+      "server": "127.0.0.1",
+      "server_port": 40000
+    }
+  ]
 }
 EOF
 
-systemctl enable sing-box --now
+systemctl restart sing-box
+systemctl enable sing-box
 
-### ===== Nginx 订阅 =====
-SUB=$(tr -dc a-z0-9 </dev/urandom | head -c 8)
-USER=sub
-PASS=$(tr -dc A-Za-z0-9 </dev/urandom | head -c 12)
-
-htpasswd -bc /etc/nginx/.htpasswd $USER $PASS
-
-cat >/etc/nginx/sites-available/sub <<EOF
-server {
-  listen 80;
-  server_name $DOMAIN;
-
-  location /$SUB/sub/ {
-    auth_basic "Restricted";
-    auth_basic_user_file /etc/nginx/.htpasswd;
-    proxy_pass http://127.0.0.1:3000/;
-  }
-}
-EOF
-
-rm -f /etc/nginx/sites-enabled/default
-ln -sf /etc/nginx/sites-available/sub /etc/nginx/sites-enabled/sub
-systemctl restart nginx
-
-### ===== Cloudflare Tunnel =====
-ok "创建 Tunnel"
-TNAME=proxy-tunnel
-
-cloudflared tunnel list | grep -q $TNAME || cloudflared tunnel create $TNAME
-TID=$(cloudflared tunnel list | awk "/$TNAME/ {print \$1}")
-
-mkdir -p /etc/cloudflared
-cp /root/.cloudflared/$TID.json /etc/cloudflared/
-
-cat >/etc/cloudflared/config.yml <<EOF
-tunnel: $TID
-credentials-file: /etc/cloudflared/$TID.json
-ingress:
-  - hostname: $DOMAIN
-    service: http://127.0.0.1:80
-  - service: http_status:404
-EOF
-
-cloudflared tunnel route dns $TNAME $DOMAIN || true
-cloudflared service uninstall || true
-cloudflared service install
-systemctl restart cloudflared
-
-### ===== 完成 =====
-ok "================================="
-ok "部署完成"
-ok "订阅地址: https://$DOMAIN/$SUB/sub/"
-ok "Basic Auth 用户名: $USER"
-ok "Basic Auth 密码: $PASS"
-ok "================================="
+### ===== cloudflared 前台运行提示 =====
+echo
+echo "=============================="
+echo "节点部署完成（$ROLE）"
+echo
+echo "VLESS 节点："
+echo "vless://$UUID@$DOMAIN:443?encryption=none&security=tls&type=ws#CF-$ROLE"
+echo
+echo "请使用以下命令运行 Tunnel："
+echo "cloudflared tunnel run $TUNNEL_NAME"
+echo "=============================="
