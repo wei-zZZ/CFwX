@@ -2,7 +2,7 @@
 set -e
 
 ### ===== 用户需要修改的变量 =====
-DOMAIN_HK="hkin.9420ce.top"
+DOMAIN_HK="hking.9420ce.top"
 LA_INTERNAL="la.internal"
 
 UUID_HK="15e82e74-d472-4f24-827f-d61b434ebb4a"
@@ -12,32 +12,19 @@ UUID_LA="15e82e74-d472-4f24-827f-d61b434ebb4b"
 ROLE=""
 OS_CODENAME=""
 
-log() {
-  echo -e "\033[1;32m[INFO]\033[0m $1"
-}
-
-warn() {
-  echo -e "\033[1;33m[WARN]\033[0m $1"
-}
+log() { echo -e "\033[1;32m[INFO]\033[0m $1"; }
+warn() { echo -e "\033[1;33m[WARN]\033[0m $1"; }
 
 detect_role() {
-  local country
-  country=$(curl -s https://ipinfo.io/country || true)
-  if [[ "$country" == "US" ]]; then
-    ROLE="LA"
-  else
-    ROLE="HK"
-  fi
-  log "Detected role: $ROLE"
+  local c
+  c=$(curl -s https://ipinfo.io/country || true)
+  [[ "$c" == "US" ]] && ROLE="LA" || ROLE="HK"
+  log "Role: $ROLE"
 }
 
 detect_os() {
-  OS_CODENAME=$(lsb_release -cs 2>/dev/null || true)
-  if [[ -z "$OS_CODENAME" ]]; then
-    warn "Cannot detect OS codename, fallback to bookworm"
-    OS_CODENAME="bookworm"
-  fi
-  log "OS codename: $OS_CODENAME"
+  OS_CODENAME=$(lsb_release -cs 2>/dev/null || echo "bookworm")
+  log "OS: $OS_CODENAME"
 }
 
 install_base() {
@@ -46,31 +33,22 @@ install_base() {
 }
 
 install_singbox() {
-  if command -v sing-box >/dev/null 2>&1; then
-    log "sing-box already installed"
-    return
-  fi
+  command -v sing-box >/dev/null && return
   log "Installing sing-box"
   bash <(curl -fsSL https://sing-box.app/install.sh)
 }
 
 install_cloudflared() {
-  if command -v cloudflared >/dev/null 2>&1; then
-    log "cloudflared already installed"
-    return
-  fi
+  command -v cloudflared >/dev/null && return
   log "Installing cloudflared"
   wget -q https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64.deb
   dpkg -i cloudflared-linux-amd64.deb || apt -f install -y
 }
 
 install_warp() {
-  if command -v warp-cli >/dev/null 2>&1; then
-    log "WARP already installed"
-    return
-  fi
+  command -v warp-cli >/dev/null && return
 
-  log "Trying WARP install via apt repo"
+  log "Installing WARP (auto fallback)"
 
   if curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg \
     | gpg --dearmor \
@@ -81,45 +59,44 @@ https://pkg.cloudflareclient.com/ ${OS_CODENAME} main" \
       > /etc/apt/sources.list.d/cloudflare-warp.list
 
     if apt update && apt install -y cloudflare-warp; then
-      log "WARP installed via apt repo"
+      log "WARP installed via apt"
       return
     fi
   fi
 
-  warn "Apt repo failed, trying direct deb package"
-
-  local deb_url="https://pkg.cloudflareclient.com/pool/${OS_CODENAME}/main/c/cloudflare-warp/cloudflare-warp_latest_amd64.deb"
-
-  if wget -O /tmp/cloudflare-warp.deb "$deb_url"; then
-    if dpkg -i /tmp/cloudflare-warp.deb || apt -f install -y; then
-      log "WARP installed via deb package"
-      return
-    fi
+  warn "Apt failed, trying direct deb"
+  if wget -O /tmp/warp.deb \
+    "https://pkg.cloudflareclient.com/pool/${OS_CODENAME}/main/c/cloudflare-warp/cloudflare-warp_latest_amd64.deb"; then
+    dpkg -i /tmp/warp.deb || apt -f install -y
   fi
-
-  warn "WARP installation failed, continue without WARP"
 }
 
 start_warp() {
-  if ! command -v warp-cli >/dev/null 2>&1; then
-    warn "warp-cli not found, skipping WARP startup"
-    return
+  command -v warp-cli >/dev/null || { warn "warp-cli not found"; return; }
+
+  log "Initializing WARP"
+
+  if warp-cli --help | grep -q registration; then
+    warp-cli registration new || true
+    warp-cli mode proxy || true
+  else
+    warp-cli register || true
+    warp-cli set-mode proxy || true
   fi
 
-  log "Starting WARP (proxy mode)"
-  warp-cli register || true
-  warp-cli set-mode proxy || true
   warp-cli connect || true
 }
 
 setup_cloudflared() {
   mkdir -p /etc/cloudflared
 
-  log "Cloudflare Tunnel login required"
+  log "Cloudflare Tunnel login"
   cloudflared tunnel login
 
   if [[ "$ROLE" == "HK" ]]; then
     cloudflared tunnel create hk-tunnel || true
+    cloudflared tunnel route dns hk-tunnel ${DOMAIN_HK} || warn "DNS record exists, skipped"
+
     cat > /etc/cloudflared/config.yml <<EOF
 tunnel: hk-tunnel
 credentials-file: /etc/cloudflared/hk-tunnel.json
@@ -128,9 +105,10 @@ ingress:
     service: http://127.0.0.1:10000
   - service: http_status:404
 EOF
-    cloudflared tunnel route dns hk-tunnel ${DOMAIN_HK}
   else
     cloudflared tunnel create la-tunnel || true
+    cloudflared tunnel route dns la-tunnel ${LA_INTERNAL} || warn "DNS record exists, skipped"
+
     cat > /etc/cloudflared/config.yml <<EOF
 tunnel: la-tunnel
 credentials-file: /etc/cloudflared/la-tunnel.json
@@ -139,7 +117,6 @@ ingress:
     service: http://127.0.0.1:20000
   - service: http_status:404
 EOF
-    cloudflared tunnel route dns la-tunnel ${LA_INTERNAL}
   fi
 
   mkdir -p /etc/systemd/system/cloudflared.service.d
@@ -216,7 +193,7 @@ uninstall_all() {
   rm -rf /etc/sing-box /etc/cloudflared \
          /etc/apt/sources.list.d/cloudflare-warp.list \
          /usr/share/keyrings/cloudflare-warp.gpg
-  log "Uninstalled all components"
+  log "All components removed"
 }
 
 case "$1" in
@@ -233,7 +210,6 @@ case "$1" in
     start_warp
     setup_cloudflared
     setup_singbox
-    log "$ROLE node deployment completed"
+    log "$ROLE deployment completed successfully"
     ;;
 esac
-  
