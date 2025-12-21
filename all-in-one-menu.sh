@@ -69,23 +69,57 @@ warp-cli connect || true
 ### ===== cloudflared =====
 if ! command -v cloudflared >/dev/null; then
   install_cloudflared() {
-  if command -v cloudflared >/dev/null; then
+  if command -v cloudflared >/dev/null 2>&1; then
     echo "[INFO] cloudflared already installed"
     return
   fi
 
-  echo "[INFO] Installing cloudflared"
+  echo "[INFO] Installing cloudflared..."
+
+  # 尝试官方 apt 仓库
+  if command -v lsb_release >/dev/null 2>&1; then
+    CODENAME=$(lsb_release -cs)
+  else
+    CODENAME=$(grep VERSION_CODENAME /etc/os-release | cut -d= -f2)
+  fi
 
   mkdir -p /etc/apt/keyrings
-  curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
-    | tee /etc/apt/keyrings/cloudflare.gpg >/dev/null
 
-  echo "deb [signed-by=/etc/apt/keyrings/cloudflare.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" \
-    | tee /etc/apt/sources.list.d/cloudflared.list
+  if curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
+      -o /etc/apt/keyrings/cloudflare.gpg; then
 
-  apt update
-  apt install -y cloudflared
+    echo "deb [signed-by=/etc/apt/keyrings/cloudflare.gpg] https://pkg.cloudflare.com/cloudflared ${CODENAME} main" \
+      > /etc/apt/sources.list.d/cloudflared.list
+
+    apt update && apt install -y cloudflared && return
+  fi
+
+  echo "[WARN] APT 安装失败，回退为二进制安装"
+
+  # 二进制兜底
+  curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
+    -o /usr/local/bin/cloudflared
+  chmod +x /usr/local/bin/cloudflared
+
+  # 手动 systemd
+  cat >/etc/systemd/system/cloudflared.service <<'EOF'
+[Unit]
+Description=Cloudflare Tunnel
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cloudflared tunnel run
+Restart=on-failure
+User=root
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
 }
+
 
 fi
 
