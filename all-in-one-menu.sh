@@ -37,20 +37,21 @@ if [[ "$ACTION" == "2" ]]; then
   exit 0
 fi
 
-### ================= 输入域名 =================
+### ================= 输入参数 =================
 read -rp "请输入你的域名（如 hk.example.com）: " DOMAIN
 [[ -z "$DOMAIN" ]] && err "域名不能为空" && exit 1
 
 UUID=$(cat /proc/sys/kernel/random/uuid)
 WS_PATH="/ws-$(openssl rand -hex 4)"
+TUNNEL_NAME="argo-xray"
 
 info "UUID: $UUID"
 info "WS Path: $WS_PATH"
 
 ### ================= 依赖 =================
-info "安装基础依赖"
+info "安装依赖"
 apt update -y
-apt install -y curl unzip jq ca-certificates
+apt install -y curl unzip ca-certificates jq
 
 ### ================= 安装 Xray =================
 if ! command -v xray >/dev/null; then
@@ -60,7 +61,7 @@ if ! command -v xray >/dev/null; then
   install -m 755 /tmp/xray/xray /usr/local/bin/xray
 fi
 
-### ================= 配置 Xray =================
+### ================= Xray 配置 =================
 info "配置 Xray"
 mkdir -p /etc/xray
 
@@ -94,7 +95,7 @@ EOF
 
 cat > /etc/systemd/system/xray.service <<EOF
 [Unit]
-Description=Xray Service
+Description=Xray
 After=network.target
 
 [Service]
@@ -108,7 +109,7 @@ EOF
 systemctl daemon-reload
 systemctl enable --now xray
 
-### ================= 安装 cloudflared（二进制） =================
+### ================= 安装 cloudflared =================
 if ! command -v cloudflared >/dev/null; then
   info "安装 cloudflared"
   curl -fsSL https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 \
@@ -118,30 +119,42 @@ fi
 
 ### ================= Cloudflare 登录 =================
 if [[ ! -f /root/.cloudflared/cert.pem ]]; then
-  warn "请进行 Cloudflare 登录（浏览器打开）"
+  warn "请进行 Cloudflare 登录（浏览器）"
   cloudflared tunnel login
 fi
 
-### ================= 创建 Tunnel（修正版） =================
-TUNNEL_NAME="argo-xray"
-CRED_FILE="/etc/cloudflared/${TUNNEL_NAME}.json"
+### ================= 创建 Tunnel（secure_tunnel 思路） =================
 mkdir -p /etc/cloudflared
 
 if ! cloudflared tunnel list | grep -q "$TUNNEL_NAME"; then
-  info "创建 Tunnel（指定 credentials-file）"
-  cloudflared tunnel create "$TUNNEL_NAME" \
-    --credentials-file "$CRED_FILE"
-else
-  info "Tunnel 已存在"
+  info "创建 Tunnel"
+  cloudflared tunnel create "$TUNNEL_NAME"
 fi
 
+info "等待 tunnel 注册完成..."
+sleep 2
+
 TUNNEL_ID=$(cloudflared tunnel list | awk "/$TUNNEL_NAME/ {print \$1}")
+[[ -z "$TUNNEL_ID" ]] && err "获取 Tunnel ID 失败" && exit 1
+
 info "Tunnel ID: $TUNNEL_ID"
+
+### === 等待 credentials 文件真实出现 ===
+for i in {1..10}; do
+  if [[ -f "/root/.cloudflared/${TUNNEL_ID}.json" ]]; then
+    break
+  fi
+  sleep 1
+done
+
+[[ ! -f "/root/.cloudflared/${TUNNEL_ID}.json" ]] && err "credentials 文件未生成" && exit 1
+
+cp "/root/.cloudflared/${TUNNEL_ID}.json" /etc/cloudflared/
 
 ### ================= cloudflared 配置 =================
 cat > /etc/cloudflared/config.yml <<EOF
 tunnel: $TUNNEL_ID
-credentials-file: $CRED_FILE
+credentials-file: /etc/cloudflared/${TUNNEL_ID}.json
 
 ingress:
   - hostname: $DOMAIN
@@ -169,17 +182,15 @@ systemctl enable --now cloudflared
 
 ### ================= 输出节点 =================
 echo
-echo "================= 节点信息 ================="
+echo "=========== 节点信息 ==========="
 echo "协议: VLESS"
 echo "地址: $DOMAIN"
 echo "端口: 443"
 echo "UUID: $UUID"
-echo "加密: none"
-echo "传输: WS"
-echo "WS 路径: $WS_PATH"
-echo "SNI / Host: $DOMAIN"
+echo "WS Path: $WS_PATH"
 echo "TLS: 开"
+echo "SNI: $DOMAIN"
 echo
 echo "VLESS 链接："
 echo "vless://$UUID@$DOMAIN:443?encryption=none&security=tls&type=ws&host=$DOMAIN&path=$WS_PATH#Argo-WS"
-echo "==========================================="
+echo "================================"
