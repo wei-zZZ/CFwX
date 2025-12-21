@@ -94,7 +94,8 @@ setup_cloudflared() {
   cloudflared tunnel login
 
   if [[ "$ROLE" == "HK" ]]; then
-    cloudflared tunnel create hk-tunnel || true
+    cloudflared tunnel list | grep -q hk-tunnel || cloudflared tunnel create hk-tunnel
+ || true
     cloudflared tunnel route dns hk-tunnel ${DOMAIN_HK} || warn "DNS record exists, skipped"
 
     cat > /etc/cloudflared/config.yml <<EOF
@@ -126,7 +127,12 @@ Environment=NO_PROXY=127.0.0.1,localhost
 EOF
 
   systemctl daemon-reexec
-  systemctl enable cloudflared --now
+  if ! systemctl list-unit-files | grep -q cloudflared.service; then
+  cloudflared service install
+fi
+
+systemctl enable cloudflared --now
+
 }
 
 setup_singbox() {
