@@ -12,8 +12,6 @@ Cloudflare Tunnel 的 login 授权步骤必须人工完成一次（CF 官方限�
 1️⃣ 在 HK / LA 两台服务器都执行
 
 ```
-
-
 curl -sSL -o install-singbox.sh https://raw.githubusercontent.com/wei-zZZ/CFwX/main/install-singbox.sh && chmod +x install-singbox.sh && sudo ./install-singbox.sh
 ```
 脚本会自动：
