@@ -1,229 +1,170 @@
 #!/usr/bin/env bash
 set -e
 
-############################
-# 基础可修改参数
-############################
-DEFAULT_DOMAIN="example.com"
-HK_TUNNEL_NAME="hk-tunnel"
-LA_TUNNEL_NAME="la-tunnel"
+### ===== 基础 =====
+CFD_BIN=/usr/local/bin/cloudflared
+CFD_DIR=/etc/cloudflared
+SB_DIR=/etc/sing-box
+SUB_DIR=/var/www/html/sub
+ARCH=$(uname -m)
 
-SB_SOCKS_PORT=1080
-SB_HTTP_PORT=2080
+info() { echo -e "\033[32m[INFO]\033[0m $1"; }
+warn() { echo -e "\033[33m[WARN]\033[0m $1"; }
+err()  { echo -e "\033[31m[ERR]\033[0m $1"; exit 1; }
 
-############################
-# 工具函数
-############################
-green(){ echo -e "\033[32m$*\033[0m"; }
-yellow(){ echo -e "\033[33m$*\033[0m"; }
-red(){ echo -e "\033[31m$*\033[0m"; }
+[[ $EUID -ne 0 ]] && err "请用 root 运行"
 
-require_root() {
-  if [ "$EUID" -ne 0 ]; then
-    red "请使用 root 运行"
-    exit 1
-  fi
-}
+### ===== 选择 =====
+echo "1) 安装 HK 节点"
+echo "2) 安装 LA 节点"
+echo "3) 卸载"
+read -rp "请选择: " ACTION
 
-############################
-# cloudflared 安装（兜底）
-############################
-install_cloudflared() {
-  if command -v cloudflared >/dev/null 2>&1; then
-    green "[INFO] cloudflared 已存在"
-    return
-  fi
+### ===== 参数输入 =====
+if [[ "$ACTION" == "1" || "$ACTION" == "2" ]]; then
+  read -rp "请输入域名 (如 hk.example.com): " DOMAIN
+  read -rp "请输入 sing-box 端口 [3000]: " SB_PORT
+  SB_PORT=${SB_PORT:-3000}
+fi
 
-  green "[INFO] 使用官方二进制安装 cloudflared（推荐）"
+### ===== 卸载 =====
+if [[ "$ACTION" == "3" ]]; then
+  info "停止服务"
+  systemctl stop cloudflared sing-box 2>/dev/null || true
+  systemctl disable cloudflared sing-box 2>/dev/null || true
 
-  ARCH=$(uname -m)
+  info "删除文件"
+  rm -rf /etc/cloudflared /etc/sing-box /usr/local/bin/cloudflared
+  rm -rf /root/.cloudflared
+  rm -rf /var/www/html/sub
+
+  info "卸载完成"
+  exit 0
+fi
+
+### ===== 安装依赖 =====
+info "安装基础依赖"
+apt update
+apt install -y curl wget tar nginx
+
+### ===== 安装 cloudflared（二进制，避免 apt 坑）=====
+if [[ ! -x $CFD_BIN ]]; then
+  info "安装 cloudflared"
   case "$ARCH" in
-    x86_64|amd64) BIN="cloudflared-linux-amd64" ;;
-    aarch64|arm64) BIN="cloudflared-linux-arm64" ;;
-    *)
-      red "不支持的架构: $ARCH"
-      exit 1
-      ;;
+    x86_64) CFD_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64" ;;
+    aarch64) CFD_URL="https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-arm64" ;;
+    *) err "不支持的架构 $ARCH" ;;
   esac
+  curl -L "$CFD_URL" -o $CFD_BIN
+  chmod +x $CFD_BIN
+fi
 
-  curl -L "https://github.com/cloudflare/cloudflared/releases/latest/download/${BIN}" \
-    -o /usr/local/bin/cloudflared
+### ===== Cloudflare 登录 =====
+if [[ ! -f /root/.cloudflared/cert.pem ]]; then
+  info "请在浏览器完成 Cloudflare 登录"
+  cloudflared tunnel login
+fi
 
-  chmod +x /usr/local/bin/cloudflared
+### ===== 创建 Tunnel =====
+TUNNEL_NAME=$([[ "$ACTION" == "1" ]] && echo "hk-tunnel" || echo "la-tunnel")
 
-  cat >/etc/systemd/system/cloudflared.service <<'EOF'
+if ! cloudflared tunnel list | grep -q "$TUNNEL_NAME"; then
+  cloudflared tunnel create "$TUNNEL_NAME"
+fi
+
+TUNNEL_ID=$(cloudflared tunnel list | grep "$TUNNEL_NAME" | awk '{print $1}')
+CRED_FILE="$CFD_DIR/$TUNNEL_ID.json"
+
+mkdir -p $CFD_DIR
+cp /root/.cloudflared/$TUNNEL_ID.json $CRED_FILE
+
+cloudflared tunnel route dns "$TUNNEL_NAME" "$DOMAIN" || warn "DNS 已存在，跳过"
+
+### ===== cloudflared 配置 =====
+cat > $CFD_DIR/config.yml <<EOF
+tunnel: $TUNNEL_ID
+credentials-file: $CRED_FILE
+
+ingress:
+  - hostname: $DOMAIN
+    service: http://127.0.0.1:$SB_PORT
+  - service: http_status:404
+EOF
+
+### ===== systemd =====
+cat > /etc/systemd/system/cloudflared.service <<EOF
 [Unit]
-Description=Cloudflare Tunnel
+Description=Cloudflared Tunnel
 After=network.target
 
 [Service]
-Type=simple
-ExecStart=/usr/local/bin/cloudflared --no-autoupdate tunnel run
-Restart=on-failure
-User=root
+ExecStart=$CFD_BIN --no-autoupdate --config $CFD_DIR/config.yml tunnel run
+Restart=always
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-  systemctl daemon-reload
-}
+systemctl daemon-reexec
+systemctl enable cloudflared
+systemctl restart cloudflared
 
-
-############################
-# Cloudflare 登录（只提示）
-############################
-ensure_cf_login() {
-  if [ ! -f /root/.cloudflared/cert.pem ]; then
-    yellow "需要 Cloudflare 登录"
-    yellow "请在新窗口执行： cloudflared tunnel login"
-    read -p "完成网页登录后按 Enter 继续..."
-  fi
-}
-
-############################
-# sing-box
-############################
-install_singbox() {
-  if command -v sing-box >/dev/null 2>&1; then
-    green "[INFO] sing-box 已存在"
-    return
-  fi
+### ===== 安装 sing-box =====
+if [[ ! -x /usr/bin/sing-box ]]; then
+  info "安装 sing-box"
   curl -fsSL https://sing-box.app/install.sh | bash
-}
+fi
 
-############################
-# WARP
-############################
-install_warp() {
-  if ! command -v warp-cli >/dev/null 2>&1; then
-    curl -fsSL https://pkg.cloudflareclient.com/install.sh | bash
-    apt install -y cloudflare-warp
-  fi
+mkdir -p $SB_DIR
 
-  warp-cli registration new || true
-  warp-cli mode proxy || true
-  warp-cli connect || true
-}
+### ===== sing-box 配置（VLESS WS，示例）=====
+UUID=$(cat /proc/sys/kernel/random/uuid)
 
-############################
-# Tunnel 创建
-############################
-setup_tunnel() {
-  local NAME=$1
-  local HOST=$2
-
-  if ! cloudflared tunnel list | grep -qw "$NAME"; then
-    cloudflared tunnel create "$NAME"
-  fi
-
-  TUNNEL_ID=$(cloudflared tunnel list | awk "/$NAME/{print \$1}")
-
-  mkdir -p /etc/cloudflared
-  cp "/root/.cloudflared/${TUNNEL_ID}.json" /etc/cloudflared/
-
-  cloudflared tunnel route dns "$NAME" "$HOST" || true
-
-  cat >/etc/cloudflared/config.yml <<EOF
-tunnel: $TUNNEL_ID
-credentials-file: /etc/cloudflared/${TUNNEL_ID}.json
-
-ingress:
-  - hostname: $HOST
-    service: http://127.0.0.1:${SB_HTTP_PORT}
-  - service: http_status:404
-EOF
-
-  cloudflared service install || true
-  systemctl restart cloudflared
-}
-
-############################
-# sing-box 配置
-############################
-configure_singbox() {
-  mkdir -p /etc/sing-box
-
-  cat >/etc/sing-box/config.json <<EOF
+cat > $SB_DIR/config.json <<EOF
 {
-  "inbounds": [
-    { "type": "socks", "listen": "127.0.0.1", "listen_port": $SB_SOCKS_PORT },
-    { "type": "http", "listen": "127.0.0.1", "listen_port": $SB_HTTP_PORT }
-  ],
-  "outbounds": [
-    { "type": "direct", "tag": "direct" }
-  ],
-  "route": { "final": "direct" }
+  "inbounds": [{
+    "type": "vless",
+    "listen": "127.0.0.1",
+    "listen_port": $SB_PORT,
+    "users": [{ "uuid": "$UUID" }]
+  }],
+  "outbounds": [{ "type": "direct" }]
 }
 EOF
 
-  systemctl enable sing-box || true
-  systemctl restart sing-box
+systemctl enable sing-box
+systemctl restart sing-box
+
+### ===== 订阅生成 =====
+mkdir -p $SUB_DIR
+
+cat > $SUB_DIR/sing-box.json <<EOF
+{
+  "outbounds": [{
+    "type": "vless",
+    "server": "$DOMAIN",
+    "server_port": 443,
+    "uuid": "$UUID",
+    "tls": { "enabled": true }
+  }]
 }
+EOF
 
-############################
-# 卸载
-############################
-uninstall_all() {
-  systemctl stop cloudflared sing-box || true
-  systemctl disable cloudflared sing-box || true
+cat > $SUB_DIR/clash.yaml <<EOF
+proxies:
+- name: CF-$TUNNEL_NAME
+  type: vless
+  server: $DOMAIN
+  port: 443
+  uuid: $UUID
+  tls: true
+EOF
 
-  rm -rf /etc/cloudflared /root/.cloudflared
-  rm -rf /etc/sing-box /usr/local/bin/sing-box
-
-  apt purge -y cloudflared cloudflare-warp || true
-
-  green "已彻底卸载"
-  exit 0
-}
-
-############################
-# 主流程
-############################
-require_root
-
-echo
-echo "1) HK 安装"
-echo "2) LA 安装"
-echo "3) 卸载"
-read -p "请选择: " MODE
-
-if [[ "$MODE" == "3" ]]; then
-  uninstall_all
-fi
-
-read -p "请输入域名 (默认 $DEFAULT_DOMAIN): " DOMAIN
-DOMAIN=${DOMAIN:-$DEFAULT_DOMAIN}
-
-if [[ "$MODE" == "1" ]]; then
-  ROLE="HK"
-  TUNNEL_NAME=$HK_TUNNEL_NAME
-  HOST="hk.${DOMAIN}"
-else
-  ROLE="LA"
-  TUNNEL_NAME=$LA_TUNNEL_NAME
-  HOST="la.${DOMAIN}"
-fi
-
-green "[STEP] 安装 cloudflared"
-install_cloudflared
-
-green "[STEP] Cloudflare 登录检测"
-ensure_cf_login
-
-green "[STEP] 安装 sing-box"
-install_singbox
-
-green "[STEP] 安装 WARP"
-install_warp
-
-green "[STEP] 配置 sing-box"
-configure_singbox
-
-green "[STEP] 创建 Tunnel"
-setup_tunnel "$TUNNEL_NAME" "$HOST"
-
-green "=============================="
-green "$ROLE 节点部署完成"
-green "访问域名: https://$HOST"
-green "=============================="
+info "=============================="
+info "部署完成"
+info "节点: $TUNNEL_NAME"
+info "域名: https://$DOMAIN"
+info "订阅:"
+info "sing-box  http://$DOMAIN/sub/sing-box.json"
+info "Clash     http://$DOMAIN/sub/clash.yaml"
+info "=============================="
