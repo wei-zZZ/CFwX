@@ -68,7 +68,25 @@ warp-cli connect || true
 
 ### ===== cloudflared =====
 if ! command -v cloudflared >/dev/null; then
+  install_cloudflared() {
+  if command -v cloudflared >/dev/null; then
+    echo "[INFO] cloudflared already installed"
+    return
+  fi
+
+  echo "[INFO] Installing cloudflared"
+
+  mkdir -p /etc/apt/keyrings
+  curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg \
+    | tee /etc/apt/keyrings/cloudflare.gpg >/dev/null
+
+  echo "deb [signed-by=/etc/apt/keyrings/cloudflare.gpg] https://pkg.cloudflare.com/cloudflared $(lsb_release -cs) main" \
+    | tee /etc/apt/sources.list.d/cloudflared.list
+
+  apt update
   apt install -y cloudflared
+}
+
 fi
 
 if [ ! -f /root/.cloudflared/cert.pem ]; then
