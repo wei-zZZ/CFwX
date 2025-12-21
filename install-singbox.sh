@@ -5,8 +5,8 @@ ROLE=""
 DOMAIN_HK="hk.your-domain.com"
 LA_INTERNAL="la.internal"
 
-UUID_HK="11111111-1111-1111-1111-111111111111"
-UUID_LA="22222222-2222-2222-2222-222222222222"
+UUID_HK="15e82e74-d472-4f24-827f-d61b434ebb4a"
+UUID_LA="15e82e74-d472-4f24-827f-d61b434ebb4b"
 
 detect_role() {
   country=$(curl -s https://ipinfo.io/country || true)
