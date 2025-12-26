@@ -4,7 +4,7 @@
 ✅ LA 作为中继出口
 ✅ CF Tunnel 组内网
 ✅ 可重复执行 / 可卸载
-
+VQ734zT5-9S4r72GZ-820eXDS1
 ⚠️ 说明一句：
 Cloudflare Tunnel 的 login 授权步骤必须人工完成一次（CF 官方限制），脚本会在正确的地方停下来让你操作。
 
